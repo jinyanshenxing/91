@@ -170,6 +170,67 @@ func TestPreviewWorkerDoesNotUploadTeaserWhenRemoteDirIsConfigured(t *testing.T)
 	}
 }
 
+func TestPreviewWorkerSkipsTeaserForVideoLargerThanFiveGiB(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-large-video")
+	video.Size = maxPreviewTeaserSizeBytes + 1
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{}
+	drv := &previewFakeDrive{}
+	worker := NewWorker(gen, cat, drv, "")
+
+	worker.process(ctx, video)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.PreviewStatus != previewStatusSkipped {
+		t.Fatalf("preview status = %q, want skipped", got.PreviewStatus)
+	}
+	if got.PreviewLocal != "" {
+		t.Fatalf("preview local = %q, want empty", got.PreviewLocal)
+	}
+	if drv.streamCalls != 0 {
+		t.Fatalf("stream calls = %d, want 0", drv.streamCalls)
+	}
+	if gen.generateCalls != 0 {
+		t.Fatalf("generate calls = %d, want 0", gen.generateCalls)
+	}
+}
+
+func TestPreviewWorkerGeneratesTeaserAtFiveGiBBoundary(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-five-gib-video")
+	video.Size = maxPreviewTeaserSizeBytes
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{}
+	drv := &previewFakeDrive{}
+	worker := NewWorker(gen, cat, drv, "")
+
+	worker.process(ctx, video)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.PreviewStatus != "ready" {
+		t.Fatalf("preview status = %q, want ready", got.PreviewStatus)
+	}
+	if drv.streamCalls != 1 {
+		t.Fatalf("stream calls = %d, want 1", drv.streamCalls)
+	}
+	if gen.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
+	}
+}
+
 func TestPreviewWorkerRateLimitLeavesCurrentPendingAndSkipsNextVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, first := seedPreviewTestVideo(t, "preview-rate-limit-1")

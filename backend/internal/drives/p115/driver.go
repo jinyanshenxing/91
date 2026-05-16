@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	sdk "github.com/SheltonZhu/115driver/pkg/driver"
@@ -20,6 +22,10 @@ type Driver struct {
 	rootID string
 	client *sdk.Pan115Client
 	ua     string
+
+	listMu       sync.Mutex
+	lastListAt   time.Time
+	listInterval time.Duration
 }
 
 type Config struct {
@@ -39,10 +45,11 @@ func New(c Config) *Driver {
 		ua = sdk.UA115Browser
 	}
 	return &Driver{
-		id:     c.ID,
-		cookie: c.Cookie,
-		rootID: rootID,
-		ua:     ua,
+		id:           c.ID,
+		cookie:       c.Cookie,
+		rootID:       rootID,
+		ua:           ua,
+		listInterval: 2 * time.Second,
 	}
 }
 
@@ -60,7 +67,7 @@ func (d *Driver) Init(ctx context.Context) error {
 }
 
 func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error) {
-	files, err := d.client.ListWithLimit(dirID, sdk.FileListLimit)
+	files, err := d.listWithRetry(ctx, dirID)
 	if err != nil {
 		return nil, fmt.Errorf("115 list: %w", err)
 	}
@@ -72,6 +79,82 @@ func (d *Driver) List(ctx context.Context, dirID string) ([]drives.Entry, error)
 		out = append(out, fileToEntry(&f, dirID))
 	}
 	return out, nil
+}
+
+func (d *Driver) listWithRetry(ctx context.Context, dirID string) (*[]sdk.File, error) {
+	d.listMu.Lock()
+	defer d.listMu.Unlock()
+
+	cooldowns := []time.Duration{30 * time.Minute, 60 * time.Minute, 120 * time.Minute}
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if err := d.waitForListSlotLocked(ctx); err != nil {
+			return nil, err
+		}
+
+		files, err := d.client.ListWithLimit(dirID, sdk.MaxDirPageLimit)
+		if err == nil {
+			return files, nil
+		}
+		lastErr = err
+		if !isTransient115ListError(err) || attempt >= len(cooldowns) {
+			break
+		}
+		cooldown := cooldowns[attempt]
+		log.Printf("[p115] list cooling down drive=%s dir=%s cooldown=%s attempt=%d/%d", d.id, dirID, cooldown, attempt+1, len(cooldowns))
+		if err := sleepContext(ctx, cooldown); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (d *Driver) waitForListSlotLocked(ctx context.Context) error {
+	if d.listInterval <= 0 || d.lastListAt.IsZero() {
+		d.lastListAt = time.Now()
+		return ctx.Err()
+	}
+
+	next := d.lastListAt.Add(d.listInterval)
+	now := time.Now()
+	if now.Before(next) {
+		if err := sleepContext(ctx, next.Sub(now)); err != nil {
+			return err
+		}
+	}
+	d.lastListAt = time.Now()
+	return ctx.Err()
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isTransient115ListError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "405") ||
+		strings.Contains(text, "429") ||
+		strings.Contains(text, "too many request") ||
+		strings.Contains(text, "too many requests") ||
+		strings.Contains(text, "blocked") ||
+		strings.Contains(text, "security") ||
+		strings.Contains(text, "waf") ||
+		strings.Contains(text, "unexpected error") ||
+		strings.Contains(text, "访问被阻断") ||
+		strings.Contains(text, "安全威胁")
 }
 
 func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error) {
@@ -208,13 +291,15 @@ func splitPath(p string) []string {
 
 func fileToEntry(f *sdk.File, parentID string) drives.Entry {
 	return drives.Entry{
-		ID:       f.FileID,
-		Name:     f.Name,
-		Size:     f.Size,
-		IsDir:    f.IsDirectory,
-		ParentID: parentID,
-		MimeType: guessMime(f.Name),
-		ModTime:  f.UpdateTime,
+		ID:           f.FileID,
+		Name:         f.Name,
+		Size:         f.Size,
+		Hash:         f.Sha1,
+		IsDir:        f.IsDirectory,
+		ParentID:     parentID,
+		MimeType:     guessMime(f.Name),
+		ModTime:      f.UpdateTime,
+		ThumbnailURL: f.ThumbURL,
 	}
 }
 

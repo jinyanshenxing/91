@@ -127,6 +127,9 @@ func main() {
 		OnRegenFailedPreviews: func(driveID string) {
 			go app.regenFailedPreviews(ctx, driveID)
 		},
+		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
+			return app.driveGenerationStatuses()
+		},
 		GetPreviewEnabled: func() bool { return app.PreviewEnabled() },
 		SetPreviewEnabled: func(enabled bool) error {
 			return app.SetPreviewEnabled(ctx, enabled)
@@ -236,6 +239,48 @@ func (a *App) loadPreviewEnabled(ctx context.Context) {
 	a.mu.Lock()
 	a.previewEnabled = v == "1"
 	a.mu.Unlock()
+}
+
+func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
+	a.mu.Lock()
+	previewWorkers := make(map[string]*preview.Worker, len(a.workers))
+	for id, worker := range a.workers {
+		previewWorkers[id] = worker
+	}
+	thumbWorkers := make(map[string]*preview.ThumbWorker, len(a.thumbWorkers))
+	for id, worker := range a.thumbWorkers {
+		thumbWorkers[id] = worker
+	}
+	a.mu.Unlock()
+
+	out := make(map[string]api.DriveGenerationStatuses, len(previewWorkers)+len(thumbWorkers))
+	for id, worker := range previewWorkers {
+		status := out[id]
+		status.Preview = generationStatusFromPreview(worker.Status())
+		out[id] = status
+	}
+	for id, worker := range thumbWorkers {
+		status := out[id]
+		status.Thumbnail = generationStatusFromPreview(worker.Status())
+		out[id] = status
+	}
+	return out
+}
+
+func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus {
+	state := status.State
+	if state == "" {
+		state = "idle"
+	}
+	out := api.GenerationStatus{
+		State:        state,
+		CurrentTitle: status.CurrentTitle,
+		QueueLength:  status.QueueLength,
+	}
+	if !status.CooldownUntil.IsZero() {
+		out.CooldownUntil = status.CooldownUntil.Format(time.RFC3339)
+	}
+	return out
 }
 
 func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
@@ -411,6 +456,9 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 	previewEnabled := a.previewEnabled
 	a.mu.Unlock()
 
+	if thumbWorker != nil {
+		go a.enqueueThumbnails(ctx, driveID, thumbWorker)
+	}
 	if previewEnabled && worker != nil {
 		go a.enqueuePending(ctx, driveID, worker)
 	}
@@ -507,7 +555,7 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 		log.Printf("[scan] drive=%s error: %v", driveID, err)
 		return
 	}
-	log.Printf("[scan] drive=%s done scanned=%d added=%d", driveID, stats.Scanned, stats.Added)
+	log.Printf("[scan] drive=%s done scanned=%d added=%d errors=%d", driveID, stats.Scanned, stats.Added, stats.Errors)
 	if drv.Kind() == "pikpak" {
 		if stats.Errors > 0 {
 			log.Printf("[cleanup] skip stale PikPak cleanup for drive=%s: scan had %d directory errors", driveID, stats.Errors)

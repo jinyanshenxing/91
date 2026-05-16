@@ -18,15 +18,28 @@ type AdminServer struct {
 	// LocalPreviewDir is the local directory that stores generated teasers and thumbs.
 	LocalPreviewDir string
 	// Hooks：外层注入实际执行者
-	OnDriveSaved          func(driveID string) error
-	OnDriveRemoved        func(driveID string)
-	OnScanRequested       func(driveID string)
-	OnRegenPreview        func(videoID string)
-	OnRegenAllPreviews    func()
-	OnRegenFailedPreviews func(driveID string)
+	OnDriveSaved               func(driveID string) error
+	OnDriveRemoved             func(driveID string)
+	OnScanRequested            func(driveID string)
+	OnRegenPreview             func(videoID string)
+	OnRegenAllPreviews         func()
+	OnRegenFailedPreviews      func(driveID string)
+	GetDriveGenerationStatuses func() map[string]DriveGenerationStatuses
 	// Preview 开关读写
 	GetPreviewEnabled func() bool
 	SetPreviewEnabled func(enabled bool) error
+}
+
+type GenerationStatus struct {
+	State         string `json:"state"`
+	CurrentTitle  string `json:"currentTitle,omitempty"`
+	QueueLength   int    `json:"queueLength"`
+	CooldownUntil string `json:"cooldownUntil,omitempty"`
+}
+
+type DriveGenerationStatuses struct {
+	Thumbnail GenerationStatus `json:"thumbnail"`
+	Preview   GenerationStatus `json:"preview"`
 }
 
 func (a *AdminServer) Register(r chi.Router) {
@@ -114,31 +127,46 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	generationStatuses := map[string]DriveGenerationStatuses{}
+	if a.GetDriveGenerationStatuses != nil {
+		generationStatuses = a.GetDriveGenerationStatuses()
+	}
 	// 出参不返回凭证明文，只告诉前端是否已配置
 	type out struct {
-		ID                 string `json:"id"`
-		Kind               string `json:"kind"`
-		Name               string `json:"name"`
-		RootID             string `json:"rootId"`
-		ScanRootID         string `json:"scanRootId"`
-		Status             string `json:"status"`
-		LastError          string `json:"lastError,omitempty"`
-		HasCredential      bool   `json:"hasCredential"`
-		TeaserReadyCount   int    `json:"teaserReadyCount"`
-		TeaserPendingCount int    `json:"teaserPendingCount"`
-		TeaserFailedCount  int    `json:"teaserFailedCount"`
+		ID                        string           `json:"id"`
+		Kind                      string           `json:"kind"`
+		Name                      string           `json:"name"`
+		RootID                    string           `json:"rootId"`
+		ScanRootID                string           `json:"scanRootId"`
+		Status                    string           `json:"status"`
+		LastError                 string           `json:"lastError,omitempty"`
+		HasCredential             bool             `json:"hasCredential"`
+		ThumbnailGenerationStatus GenerationStatus `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus   GenerationStatus `json:"previewGenerationStatus"`
+		TeaserReadyCount          int              `json:"teaserReadyCount"`
+		TeaserPendingCount        int              `json:"teaserPendingCount"`
+		TeaserFailedCount         int              `json:"teaserFailedCount"`
 	}
 	list := make([]out, 0, len(drives))
 	for _, d := range drives {
 		counts := teaserCounts[d.ID]
+		generation := generationStatuses[d.ID]
+		if generation.Thumbnail.State == "" {
+			generation.Thumbnail.State = "idle"
+		}
+		if generation.Preview.State == "" {
+			generation.Preview.State = "idle"
+		}
 		list = append(list, out{
 			ID: d.ID, Kind: d.Kind, Name: d.Name,
 			RootID: d.RootID, ScanRootID: d.ScanRootID,
 			Status: d.Status, LastError: d.LastError,
-			HasCredential:      len(d.Credentials) > 0,
-			TeaserReadyCount:   counts.Ready,
-			TeaserPendingCount: counts.Pending,
-			TeaserFailedCount:  counts.Failed,
+			HasCredential:             len(d.Credentials) > 0,
+			ThumbnailGenerationStatus: generation.Thumbnail,
+			PreviewGenerationStatus:   generation.Preview,
+			TeaserReadyCount:          counts.Ready,
+			TeaserPendingCount:        counts.Pending,
+			TeaserFailedCount:         counts.Failed,
 		})
 	}
 	writeJSON(w, http.StatusOK, list)

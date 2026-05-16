@@ -61,9 +61,18 @@ export type AdminDrive = {
   status: string;
   lastError?: string;
   hasCredential: boolean;
+  thumbnailGenerationStatus?: DriveGenerationStatus;
+  previewGenerationStatus?: DriveGenerationStatus;
   teaserReadyCount: number;
   teaserPendingCount: number;
   teaserFailedCount: number;
+};
+
+export type DriveGenerationStatus = {
+  state: string;
+  currentTitle?: string;
+  queueLength: number;
+  cooldownUntil?: string;
 };
 
 export function listDrives() {

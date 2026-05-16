@@ -59,8 +59,21 @@ export function DrivesPage() {
     }
   }
 
+  async function refreshDriveList() {
+    try {
+      const data = await api.listDrives();
+      setList(data ?? []);
+    } catch {
+      // 保持当前页面状态，下一次轮询或手动操作再刷新。
+    }
+  }
+
   useEffect(() => {
     refresh();
+    const timer = window.setInterval(() => {
+      refreshDriveList();
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
   function openCreate() {
@@ -168,6 +181,7 @@ export function DrivesPage() {
               <th>类型</th>
               <th>ID</th>
               <th>状态</th>
+              <th>生成状态</th>
               <th>扫描根</th>
               <th>本地占用</th>
               <th>Teaser</th>
@@ -182,6 +196,9 @@ export function DrivesPage() {
                 <td data-label="ID" style={{ fontFamily: "ui-monospace", fontSize: 12 }}>{d.id}</td>
                 <td data-label="状态">
                   <StatusTag status={d.status} error={d.lastError} hasCred={d.hasCredential} />
+                </td>
+                <td data-label="生成状态">
+                  <GenerationStatusCell drive={d} />
                 </td>
                 <td data-label="扫描根" style={{ fontFamily: "ui-monospace", fontSize: 12 }}>
                   {d.scanRootId || d.rootId}
@@ -202,7 +219,9 @@ export function DrivesPage() {
                     onClick={() => handleRegenFailed(d)}
                   >
                     <RotateCcw size={13} />
-                    {regenFailedId === d.id ? "触发中..." : "重新生成失败 teaser"}
+                    <span className="admin-btn__label">
+                      {regenFailedId === d.id ? "触发中..." : "重试失败 Teaser"}
+                    </span>
                   </button>{" "}
                   <button className="admin-btn" onClick={() => openEdit(d)}>
                     编辑
@@ -292,6 +311,93 @@ function TeaserCounts({ drive }: { drive: api.AdminDrive }) {
       </span>
     </div>
   );
+}
+
+function GenerationStatusCell({ drive }: { drive: api.AdminDrive }) {
+  return (
+    <div className="admin-generation-statuses">
+      <GenerationStatusLine label="封面" status={drive.thumbnailGenerationStatus} />
+      <GenerationStatusLine label="预览" status={drive.previewGenerationStatus} />
+    </div>
+  );
+}
+
+function GenerationStatusLine({
+  label,
+  status,
+}: {
+  label: string;
+  status?: api.DriveGenerationStatus;
+}) {
+  const state = status?.state || "idle";
+  const queueLength = status?.queueLength ?? 0;
+  const detail = generationDetail(status);
+  const title = generationTitle(status, detail);
+
+  return (
+    <div className="admin-generation-row" title={title}>
+      <span className="admin-generation-kind">{label}</span>
+      <span className={`admin-status admin-generation-state is-${generationStateClass(state)}`}>
+        {generationStateLabel(state)}
+      </span>
+      {(detail || queueLength > 0) && (
+        <span className="admin-generation-detail">
+          {[detail, queueLength > 0 ? `队列 ${queueLength}` : ""].filter(Boolean).join(" / ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function generationStateLabel(state: string): string {
+  if (state === "generating") return "生成中";
+  if (state === "cooling") return "冷却中";
+  if (state === "queued") return "排队中";
+  return "空闲";
+}
+
+function generationStateClass(state: string): string {
+  if (state === "generating" || state === "cooling" || state === "queued") {
+    return state;
+  }
+  return "idle";
+}
+
+function generationDetail(status?: api.DriveGenerationStatus): string {
+  if (!status) return "";
+  if (status.state === "cooling" && status.cooldownUntil) {
+    return `剩余 ${formatCooldownRemaining(status.cooldownUntil)}`;
+  }
+  if (status.currentTitle) {
+    return status.currentTitle;
+  }
+  return "";
+}
+
+function generationTitle(status: api.DriveGenerationStatus | undefined, detail: string): string | undefined {
+  if (!status) return detail || undefined;
+  if (status.state === "cooling" && status.cooldownUntil) {
+    return `冷却至 ${formatClock(status.cooldownUntil)}`;
+  }
+  return status.currentTitle || detail || undefined;
+}
+
+function formatCooldownRemaining(value: string): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const totalSeconds = Math.max(0, Math.ceil((d.getTime() - Date.now()) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}小时${minutes}分`;
+  if (minutes > 0) return `${minutes}分${seconds}秒`;
+  return `${seconds}秒`;
+}
+
+function formatClock(value: string): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
 function StatusTag({

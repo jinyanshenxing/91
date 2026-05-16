@@ -848,6 +848,7 @@ type Worker struct {
 
 	RateLimitCooldown time.Duration
 	rateLimit         rateLimitState
+	activity          taskActivity
 }
 
 func NewWorker(gen TeaserGenerator, cat *catalog.Catalog, drv drives.Drive, _ string) *Worker {
@@ -891,14 +892,57 @@ type ThumbWorker struct {
 
 	RateLimitCooldown time.Duration
 	rateLimit         rateLimitState
+	activity          taskActivity
 }
 
-const defaultRateLimitCooldown = 30 * time.Minute
+const (
+	defaultRateLimitCooldown        = 30 * time.Minute
+	maxPreviewTeaserSizeBytes int64 = 5 * 1024 * 1024 * 1024
+	previewStatusSkipped            = "skipped"
+)
 
 type rateLimitState struct {
 	mu          sync.Mutex
 	until       time.Time
 	lastSkipLog time.Time
+}
+
+type TaskStatus struct {
+	State         string
+	CurrentTitle  string
+	QueueLength   int
+	CooldownUntil time.Time
+}
+
+type taskActivity struct {
+	mu           sync.Mutex
+	currentID    string
+	currentTitle string
+}
+
+func (a *taskActivity) start(v *catalog.Video) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if v == nil {
+		a.currentID = ""
+		a.currentTitle = ""
+		return
+	}
+	a.currentID = v.ID
+	a.currentTitle = v.Title
+}
+
+func (a *taskActivity) done() {
+	a.mu.Lock()
+	a.currentID = ""
+	a.currentTitle = ""
+	a.mu.Unlock()
+}
+
+func (a *taskActivity) current() (string, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.currentID, a.currentTitle
 }
 
 func (s *rateLimitState) active(now time.Time) (time.Time, bool, bool) {
@@ -928,6 +972,15 @@ func (s *rateLimitState) pause(now time.Time, d time.Duration) time.Time {
 	s.lastSkipLog = time.Time{}
 	s.mu.Unlock()
 	return until
+}
+
+func (s *rateLimitState) coolingUntil(now time.Time) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.until.IsZero() || !now.Before(s.until) {
+		return time.Time{}, false
+	}
+	return s.until, true
 }
 
 func NewThumbWorker(gen ThumbnailGenerator, cat *catalog.Catalog, drv drives.Drive) *ThumbWorker {
@@ -963,6 +1016,45 @@ func (w *ThumbWorker) EnqueueBlocking(ctx context.Context, v *catalog.Video) boo
 	}
 }
 
+func (w *Worker) Status() TaskStatus {
+	if w == nil {
+		return TaskStatus{State: "idle"}
+	}
+	return taskStatus(&w.activity, &w.rateLimit, len(w.ch))
+}
+
+func (w *ThumbWorker) Status() TaskStatus {
+	if w == nil {
+		return TaskStatus{State: "idle"}
+	}
+	return taskStatus(&w.activity, &w.rateLimit, len(w.ch))
+}
+
+func taskStatus(activity *taskActivity, rateLimit *rateLimitState, queueLength int) TaskStatus {
+	if queueLength < 0 {
+		queueLength = 0
+	}
+	status := TaskStatus{
+		State:       "idle",
+		QueueLength: queueLength,
+	}
+	if until, ok := rateLimit.coolingUntil(time.Now()); ok {
+		status.State = "cooling"
+		status.CooldownUntil = until
+		return status
+	}
+	_, title := activity.current()
+	if title != "" {
+		status.State = "generating"
+		status.CurrentTitle = title
+		return status
+	}
+	if queueLength > 0 {
+		status.State = "queued"
+	}
+	return status
+}
+
 // Run 阻塞运行直到 ctx 取消
 func (w *Worker) Run(ctx context.Context) {
 	for {
@@ -970,7 +1062,7 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case v := <-w.ch:
-			w.process(ctx, v)
+			w.processQueued(ctx, v)
 			select {
 			case <-ctx.Done():
 				return
@@ -987,12 +1079,55 @@ func (w *ThumbWorker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case v := <-w.ch:
-			w.process(ctx, v)
+			w.processQueued(ctx, v)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(100 * time.Millisecond):
 			}
+		}
+	}
+}
+
+func (w *Worker) processQueued(ctx context.Context, v *catalog.Video) {
+	w.activity.start(v)
+	defer w.activity.done()
+	if !waitForRateLimitCooldown(ctx, &w.rateLimit, "preview", w.Drive) {
+		return
+	}
+	w.process(ctx, v)
+}
+
+func (w *ThumbWorker) processQueued(ctx context.Context, v *catalog.Video) {
+	w.activity.start(v)
+	defer w.activity.done()
+	if !waitForRateLimitCooldown(ctx, &w.rateLimit, "thumb", w.Drive) {
+		return
+	}
+	w.process(ctx, v)
+}
+
+func waitForRateLimitCooldown(ctx context.Context, state *rateLimitState, label string, drive drives.Drive) bool {
+	driveID := ""
+	if drive != nil {
+		driveID = drive.ID()
+	}
+	for {
+		until, ok := state.coolingUntil(time.Now())
+		if !ok {
+			return true
+		}
+		wait := time.Until(until)
+		if wait <= 0 {
+			continue
+		}
+		log.Printf("[%s] drive=%s cooling down until=%s; wait before next task", label, driveID, until.Format(time.RFC3339))
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
 		}
 	}
 }
@@ -1159,6 +1294,15 @@ func localPreviewLink(v *catalog.Video) (*drives.StreamLink, bool) {
 }
 
 func (w *Worker) process(ctx context.Context, v *catalog.Video) {
+	if shouldSkipTeaser(v) {
+		removePreviousLocalTeaser(v.PreviewLocal, "")
+		if err := w.Catalog.UpdatePreview(ctx, v.ID, "", "", previewStatusSkipped); err != nil {
+			log.Printf("[preview] skip %s: update status: %v", v.Title, err)
+			return
+		}
+		log.Printf("[preview] skip %s: size=%d exceeds 5GiB teaser limit", v.Title, v.Size)
+		return
+	}
 	if w.skipIfRateLimited(v) {
 		return
 	}
@@ -1205,6 +1349,10 @@ func (w *Worker) process(ctx context.Context, v *catalog.Video) {
 	removePreviousLocalTeaser(v.PreviewLocal, local)
 	w.Catalog.UpdatePreview(ctx, v.ID, "", local, "ready")
 	log.Printf("[preview] ready %s (duration=%.1fs)", v.Title, duration)
+}
+
+func shouldSkipTeaser(v *catalog.Video) bool {
+	return v != nil && v.Size > maxPreviewTeaserSizeBytes
 }
 
 func (w *Worker) generateTeaser(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64) (string, error) {

@@ -203,6 +203,11 @@
   cursor: pointer;
 }
 
+.admin-btn__label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .admin-btn:hover {
   background: #e0e0e0;
 }
@@ -293,6 +298,61 @@
   flex-wrap: wrap;
   gap: 8px;
   min-width: 150px;
+}
+
+.admin-generation-statuses {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  min-width: 190px;
+  max-width: 280px;
+}
+
+.admin-generation-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.admin-generation-kind {
+  color: var(--color-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.admin-generation-state {
+  white-space: nowrap;
+}
+
+.admin-generation-state.is-generating {
+  background: #e8f1ff;
+  color: #1f6feb;
+}
+
+.admin-generation-state.is-cooling {
+  background: #fff4e0;
+  color: #d96f00;
+}
+
+.admin-generation-state.is-queued {
+  background: #f0f0f0;
+  color: #666;
+}
+
+.admin-generation-state.is-idle {
+  background: #eef8f1;
+  color: #168a4f;
+}
+
+.admin-generation-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-muted);
+  font-size: 12px;
 }
 
 .admin-storage-cell {
@@ -412,8 +472,89 @@
 
   .admin-table.admin-drives-table .admin-status,
   .admin-table.admin-drives-table .admin-storage-cell,
+  .admin-table.admin-drives-table .admin-generation-statuses,
   .admin-table.admin-drives-table .admin-teaser-counts {
     justify-self: start;
+  }
+}
+
+@media (max-width: 560px) {
+  .admin-generation-statuses {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .admin-generation-row {
+    grid-template-columns: auto auto;
+    justify-content: start;
+  }
+
+  .admin-generation-detail {
+    grid-column: 1 / -1;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 768px) {
+  .admin-table.admin-drives-table {
+    overflow: visible;
+    border: 0;
+    background: transparent;
+  }
+
+  .admin-table.admin-drives-table tbody {
+    width: 100%;
+  }
+
+  .admin-table.admin-drives-table tr {
+    width: 100%;
+    box-sizing: border-box;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-md);
+    background: #fff;
+    overflow: hidden;
+  }
+
+  .admin-table.admin-drives-table td {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .admin-table.admin-drives-table td[data-label="名称"],
+  .admin-table.admin-drives-table td[data-label="生成状态"],
+  .admin-table.admin-drives-table td.is-actions {
+    grid-column: 1 / -1;
+  }
+
+  .admin-table.admin-drives-table td[data-label="ID"],
+  .admin-table.admin-drives-table td[data-label="扫描根"] {
+    font-size: 11px !important;
+    line-height: 1.35;
+  }
+
+  .admin-table.admin-drives-table td.is-actions {
+    min-width: 0;
+  }
+
+  .admin-table.admin-drives-table td.is-actions .admin-btn {
+    max-width: 100%;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .admin-table.admin-drives-table td.is-actions .admin-btn svg {
+    flex: 0 0 auto;
+  }
+}
+
+@media (max-width: 420px) {
+  .admin-table.admin-drives-table tr {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -160,37 +160,65 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/drives", nil)
 	rr := httptest.NewRecorder()
-	(&AdminServer{Catalog: cat}).handleListDrives(rr, req)
+	(&AdminServer{
+		Catalog: cat,
+		GetDriveGenerationStatuses: func() map[string]DriveGenerationStatuses {
+			return map[string]DriveGenerationStatuses{
+				"OneDrive": {
+					Thumbnail: GenerationStatus{State: "cooling", QueueLength: 3, CooldownUntil: "2026-05-16T21:00:00+08:00"},
+					Preview:   GenerationStatus{State: "generating", CurrentTitle: "OD Pending"},
+				},
+			}
+		},
+	}).handleListDrives(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	var got []struct {
-		ID                 string `json:"id"`
-		TeaserReadyCount   int    `json:"teaserReadyCount"`
-		TeaserPendingCount int    `json:"teaserPendingCount"`
-		TeaserFailedCount  int    `json:"teaserFailedCount"`
+		ID                        string           `json:"id"`
+		ThumbnailGenerationStatus GenerationStatus `json:"thumbnailGenerationStatus"`
+		PreviewGenerationStatus   GenerationStatus `json:"previewGenerationStatus"`
+		TeaserReadyCount          int              `json:"teaserReadyCount"`
+		TeaserPendingCount        int              `json:"teaserPendingCount"`
+		TeaserFailedCount         int              `json:"teaserFailedCount"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	byID := map[string]struct {
-		Ready   int
-		Pending int
-		Failed  int
+		Ready     int
+		Pending   int
+		Failed    int
+		Thumbnail GenerationStatus
+		Preview   GenerationStatus
 	}{}
 	for _, d := range got {
 		byID[d.ID] = struct {
-			Ready   int
-			Pending int
-			Failed  int
-		}{Ready: d.TeaserReadyCount, Pending: d.TeaserPendingCount, Failed: d.TeaserFailedCount}
+			Ready     int
+			Pending   int
+			Failed    int
+			Thumbnail GenerationStatus
+			Preview   GenerationStatus
+		}{
+			Ready:     d.TeaserReadyCount,
+			Pending:   d.TeaserPendingCount,
+			Failed:    d.TeaserFailedCount,
+			Thumbnail: d.ThumbnailGenerationStatus,
+			Preview:   d.PreviewGenerationStatus,
+		}
 	}
 	if byID["OneDrive"].Ready != 2 || byID["OneDrive"].Pending != 1 || byID["OneDrive"].Failed != 0 {
 		t.Fatalf("OneDrive counts = %#v, want ready=2 pending=1 failed=0", byID["OneDrive"])
 	}
+	if byID["OneDrive"].Thumbnail.State != "cooling" || byID["OneDrive"].Preview.State != "generating" {
+		t.Fatalf("OneDrive generation statuses = %#v, want thumbnail cooling and preview generating", byID["OneDrive"])
+	}
 	if byID["PikPak"].Ready != 0 || byID["PikPak"].Pending != 1 || byID["PikPak"].Failed != 1 {
 		t.Fatalf("PikPak counts = %#v, want ready=0 pending=1 failed=1", byID["PikPak"])
+	}
+	if byID["PikPak"].Thumbnail.State != "idle" || byID["PikPak"].Preview.State != "idle" {
+		t.Fatalf("PikPak generation statuses = %#v, want idle defaults", byID["PikPak"])
 	}
 }
 
