@@ -425,6 +425,13 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	// 先记录这次视频关联的 tag_id，便于事务末尾清理孤儿 collection 标签
+	tagIDs, err := collectVideoTagIDs(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, id); err != nil {
 		return err
 	}
@@ -435,6 +442,13 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
 		return sql.ErrNoRows
 	}
+
+	// collection 标签是 scanner 按目录名机器生成的；视频删完后若不再被引用就一起回收。
+	// system / user / auto / legacy 不在此处删除，避免破坏管理员手动维护的标签语义。
+	if err := pruneOrphanCollectionTagsByID(ctx, tx, tagIDs); err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 

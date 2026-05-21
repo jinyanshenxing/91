@@ -542,3 +542,180 @@ func sameStrings(a, b []string) bool {
 	}
 	return true
 }
+
+
+// 删除 collection 标签的最后一个引用视频后，标签应当自动从 tags 表里消失。
+// user/system 标签不受影响：用户/系统标签的语义由人维护，孤儿状态保留。
+func TestDeleteVideoPrunesOrphanCollectionTag(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, id := range []string{"video-a", "video-b"} {
+		if err := cat.UpsertVideo(ctx, &Video{
+			ID:          id,
+			DriveID:     "drive",
+			FileID:      id,
+			Title:       id,
+			Category:    "Better Call Saul S02",
+			PublishedAt: now,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	label, ok, err := cat.EnsureCollectionTag(ctx, "Better Call Saul S02")
+	if err != nil {
+		t.Fatalf("ensure collection tag: %v", err)
+	}
+	if !ok || label != "Better Call Saul S02" {
+		t.Fatalf("ensure collection tag = %q ok=%v, want collection tag created", label, ok)
+	}
+
+	// 用户标签：手动建出来，让它和 video-a 关联，验证 user 标签不会被孤儿清理流程误删。
+	if _, err := cat.CreateTagAndClassify(ctx, "用户标签", nil, "user"); err != nil {
+		t.Fatalf("create user tag: %v", err)
+	}
+	if err := cat.SetManualVideoTags(ctx, "video-a", []string{"用户标签"}); err != nil {
+		t.Fatalf("attach user tag: %v", err)
+	}
+
+	collectionExists := func() bool {
+		var n int
+		if err := cat.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM tags WHERE label = ? AND source = 'collection'`,
+			"Better Call Saul S02").Scan(&n); err != nil {
+			t.Fatalf("count collection tag: %v", err)
+		}
+		return n > 0
+	}
+	if !collectionExists() {
+		t.Fatal("collection tag missing right after creation")
+	}
+
+	// 删第一个视频：还有 video-b 在引用 collection 标签，应保留。
+	if err := cat.DeleteVideo(ctx, "video-a"); err != nil {
+		t.Fatalf("delete video-a: %v", err)
+	}
+	if !collectionExists() {
+		t.Fatal("collection tag was pruned while another video still references it")
+	}
+
+	// 删最后一个引用视频，collection 标签应当被同步清掉。
+	if err := cat.DeleteVideo(ctx, "video-b"); err != nil {
+		t.Fatalf("delete video-b: %v", err)
+	}
+	if collectionExists() {
+		t.Fatal("orphan collection tag was not pruned after deleting the last referencing video")
+	}
+
+	// 用户手动建的标签即使变成孤儿（已经因为 video-a 删除而失去引用）也必须保留。
+	var userCount int
+	if err := cat.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tags WHERE label = ? AND source = 'user'`,
+		"用户标签").Scan(&userCount); err != nil {
+		t.Fatalf("count user tag: %v", err)
+	}
+	if userCount != 1 {
+		t.Fatalf("user tag count = %d, want 1 (user-source orphans must be preserved)", userCount)
+	}
+
+	// AV 系统标签也不能被孤儿清理影响。
+	var avCount int
+	if err := cat.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM tags WHERE label = 'AV' AND source = 'system'`).Scan(&avCount); err != nil {
+		t.Fatalf("count av tag: %v", err)
+	}
+	if avCount != 1 {
+		t.Fatalf("system AV tag count = %d, want 1", avCount)
+	}
+}
+
+// 重启时 migrate 应当一次性把历史遗留的孤儿 collection 标签清掉。
+func TestMigratePrunesPreexistingOrphanCollectionTags(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+
+	// 直接往 tags 表里写两条 collection 行：一条没有任何 video_tags 关联（孤儿），另一条人为关联视频（非孤儿）。
+	now := time.Now().UnixMilli()
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO tags (label, aliases, source, created_at, updated_at) VALUES (?, '[]', 'collection', ?, ?)`,
+		"孤儿合集", now, now); err != nil {
+		t.Fatalf("insert orphan tag: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO tags (label, aliases, source, created_at, updated_at) VALUES (?, '[]', 'collection', ?, ?)`,
+		"在用合集", now, now); err != nil {
+		t.Fatalf("insert in-use tag: %v", err)
+	}
+	var inUseTagID int64
+	if err := cat.db.QueryRowContext(ctx, `SELECT id FROM tags WHERE label = ?`, "在用合集").Scan(&inUseTagID); err != nil {
+		t.Fatalf("lookup in-use tag id: %v", err)
+	}
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-keeper",
+		DriveID:     "drive",
+		FileID:      "file-keeper",
+		Title:       "keeper",
+		PublishedAt: time.Now(),
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}); err != nil {
+		t.Fatalf("seed keeper video: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO video_tags (video_id, tag_id, source, created_at) VALUES (?, ?, 'auto', ?)`,
+		"video-keeper", inUseTagID, now); err != nil {
+		t.Fatalf("attach in-use tag: %v", err)
+	}
+
+	// 同样写一个 user 来源的孤儿，验证 migrate 不会误删 user 孤儿。
+	if _, err := cat.db.ExecContext(ctx,
+		`INSERT INTO tags (label, aliases, source, created_at, updated_at) VALUES (?, '[]', 'user', ?, ?)`,
+		"用户孤儿", now, now); err != nil {
+		t.Fatalf("insert user orphan: %v", err)
+	}
+
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close before reopen: %v", err)
+	}
+
+	// 重新打开 → 触发 migrate → 应当只清掉 source='collection' 且无引用的 "孤儿合集"。
+	cat2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat2.Close() })
+
+	count := func(label string) int {
+		var n int
+		if err := cat2.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM tags WHERE label = ?`, label).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", label, err)
+		}
+		return n
+	}
+	if count("孤儿合集") != 0 {
+		t.Fatal("migrate did not prune orphan collection tag")
+	}
+	if count("在用合集") != 1 {
+		t.Fatal("migrate wrongly pruned in-use collection tag")
+	}
+	if count("用户孤儿") != 1 {
+		t.Fatal("migrate wrongly pruned user-source orphan tag")
+	}
+}

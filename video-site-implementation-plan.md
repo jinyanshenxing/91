@@ -1561,3 +1561,29 @@ Teaser 不再是"固定从第 10 秒抽 10 秒"，改为按视频时长分段挑
 - 最后一段末端留 1 秒余量，避免切到文件尾部导致 ffmpeg 读越界。
 - 单段 fallback 原因：拼接滤镜对 < 30s 视频性价比低，直接整段取一次性 25% 位置。
 - 选段未使用场景检测（`ffmpeg scdet`）：单次扫描 3000+ 视频时成本过高，留给后续 C3 按需开关。
+
+### 15.13 孤儿 collection 标签清理（已落地）
+
+**背景**：`scanner.EnsureCollectionTag` 会在扫描 115 等网盘时按目录名创建 `source='collection'` 的合集标签，并把同目录下视频自动打上。`internal/scanner/scanner.go shouldExcludeDir` 规则把名为 `影视` 的整棵子树标记为 `ExcludedFileIDs`，由 `cmd/server/main.go cleanupExcludedDriveVideos` 调 `Catalog.DeleteVideo` 把对应视频删掉。原 `DeleteVideo` 只清 `videos` + `video_tags`，`tags` 表里的合集标签会变成无引用孤儿，仍出现在标签云和管理后台（`ListTags` 用 LEFT JOIN，count=0）。
+
+**实现**：
+
+- `Catalog.DeleteVideo` 事务里：
+  1. `collectVideoTagIDs(tx, videoID)` 先记录这次视频关联的 `tag_id`。
+  2. 删 `video_tags` 和 `videos`。
+  3. `pruneOrphanCollectionTagsByID(tx, tagIDs)` 仅对 `source='collection'` 且无引用的 tag_id 执行 `DELETE FROM tags`；其它 source 一律保留。
+- `Catalog.migrate` 末尾追加 `pruneOrphanCollectionTags`：单条 `DELETE FROM tags WHERE source='collection' AND id NOT IN (SELECT tag_id FROM video_tags)`，作为启动自愈，吃掉历史遗留孤儿。
+
+**为什么只动 collection**：
+- `system`：固定标签（`AV` 等），即使临时无视频也要保留。
+- `user`：管理员手动建的，语义由人维护，孤儿状态保留，让管理员自己删。
+- `auto`/`legacy`：是基于内容/迁移的旧标签，理论上有视频在引用；保守起见不在此处自动删，避免一次启动误清掉用户依赖的标签。
+
+**代码位置**：
+- `backend/internal/catalog/catalog.go` `DeleteVideo`
+- `backend/internal/catalog/tags.go` `migrate` / `pruneOrphanCollectionTags` / `pruneOrphanCollectionTagsByID` / `collectVideoTagIDs`
+- 测试：`backend/internal/catalog/tags_test.go` `TestDeleteVideoPrunesOrphanCollectionTag` / `TestMigratePrunesPreexistingOrphanCollectionTags`
+
+**已知不在本次范围**：
+- `/admin/api/tags` 仍只有 `GET` / `POST`，没有 `DELETE`。如果将来要让管理员手动删 `user` 标签，再加 endpoint。
+- 数据迁移：上线时对运行中数据库一次性执行同样的 `DELETE` 即可（已对当前实例执行：清掉 10 条 `Season N` / `Better Call Saul SXX` / `东京爱情故事（1991）`，`tags` 总数 153 → 143）。

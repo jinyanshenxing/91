@@ -78,6 +78,9 @@ func (c *Catalog) migrate(ctx context.Context) error {
 	if err := c.hideZeroSizeVideosFromKnownDrives(ctx); err != nil {
 		return err
 	}
+	if err := c.pruneOrphanCollectionTags(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -860,4 +863,63 @@ func sortLabelsByTagOrder(tags []Tag, labels []string) []string {
 		return order[strings.ToLower(labels[i])] < order[strings.ToLower(labels[j])]
 	})
 	return labels
+}
+
+
+// pruneOrphanCollectionTags 删除所有 source='collection' 且不再被任何 video_tags 引用的标签。
+// 在 migrate 末尾调用，相当于启动时自愈：之前 DeleteVideo 没顺带清理留下的孤儿，会在重启时被收回。
+// 只动 collection：system 是固定标签需保留；user 是管理员手动建的；auto/legacy 默认有视频在引用。
+func (c *Catalog) pruneOrphanCollectionTags(ctx context.Context) error {
+	_, err := c.db.ExecContext(ctx, `
+DELETE FROM tags
+ WHERE source = 'collection'
+   AND id NOT IN (SELECT tag_id FROM video_tags)`)
+	return err
+}
+
+// pruneOrphanCollectionTagsByID 在事务里检查一组候选 tag_id，删除其中
+// source='collection' 且已经没有视频引用的标签。供 DeleteVideo 调用。
+func pruneOrphanCollectionTagsByID(ctx context.Context, tx *sql.Tx, tagIDs []int64) error {
+	for _, tagID := range tagIDs {
+		var src string
+		err := tx.QueryRowContext(ctx, `SELECT source FROM tags WHERE id = ?`, tagID).Scan(&src)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if src != "collection" {
+			continue
+		}
+		var refCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM video_tags WHERE tag_id = ?`, tagID).Scan(&refCount); err != nil {
+			return err
+		}
+		if refCount > 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tagID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectVideoTagIDs 在事务里读出当前视频关联的 tag_id，供后续清理判断。
+func collectVideoTagIDs(ctx context.Context, tx *sql.Tx, videoID string) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT tag_id FROM video_tags WHERE video_id = ?`, videoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
