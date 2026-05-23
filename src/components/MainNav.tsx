@@ -37,7 +37,24 @@ export function MainNav() {
                 className={({ isActive }) =>
                   `main-nav__link ${isActive ? "is-active" : ""}`
                 }
-                onClick={() => setOpen(false)}
+                onClick={() => {
+                  setOpen(false);
+                  if (to === "/shorts") {
+                    const el = document.documentElement;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const fn = el.requestFullscreen?.bind(el) || (el as any).webkitRequestFullscreen?.bind(el);
+                    if (fn) {
+                      try {
+                        const ret = fn();
+                        if (ret && typeof ret.then === "function") {
+                          ret.catch(() => {});
+                        }
+                      } catch {
+                        // ignore
+                      }
+                    }
+                  }
+                }}
               >
                 <Icon size={16} />
                 {label}

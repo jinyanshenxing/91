@@ -1,8 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChevronLeft, Heart, Maximize, Minimize, Volume2, VolumeX } from "lucide-react";
+import {
+  ChevronLeft,
+  Heart,
+  Maximize,
+  Minimize,
+  Volume2,
+  VolumeX,
+  Play,
+  Pause,
+  EyeOff,
+  Info,
+  Loader2,
+  Sparkles,
+  AlertCircle,
+} from "lucide-react";
 import {
   fetchShortsNext,
+  hideVideo,
   type ShortsItem,
 } from "@/data/videos";
 import "@/styles/shorts.css";
@@ -48,6 +63,54 @@ export default function ShortsPage() {
   const [activeIndex, setActiveIndex] = useState(0);
   // 是否静音；首次必须静音才能 autoplay，用户点击后切换
   const [muted, setMuted] = useState(true);
+  // 音量大小 (0 ~ 1)
+  const [volume, setVolume] = useState(0.8);
+  // 全局 Toast / HUD 提醒文字
+  const [hudText, setHudText] = useState<{ id: number; text: string; icon?: React.ReactNode } | null>(null);
+  const hudTimeoutRef = useRef<number | null>(null);
+
+  const showHud = useCallback((text: string, icon?: React.ReactNode) => {
+    if (hudTimeoutRef.current) window.clearTimeout(hudTimeoutRef.current);
+    setHudText({ id: Date.now(), text, icon });
+    hudTimeoutRef.current = window.setTimeout(() => {
+      setHudText(null);
+    }, 1500);
+  }, []);
+
+  const handleVolumeButtonClick = useCallback(() => {
+    setMuted((v) => {
+      const next = !v;
+      showHud(
+        next ? "已静音" : "音量已开启",
+        next ? <VolumeX size={16} /> : <Volume2 size={16} />
+      );
+      return next;
+    });
+  }, [showHud]);
+
+  const handleVolumeSliderChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setVolume(val);
+    if (val > 0) {
+      setMuted(false);
+    } else {
+      setMuted(true);
+    }
+    // Update active video volume directly
+    const activeVideo = videoRefs.current.get(activeIndex);
+    if (activeVideo) {
+      activeVideo.volume = val;
+      activeVideo.muted = val === 0;
+    }
+  }, [activeIndex]);
+
+  // 组件卸载时清理 HUD 定时器
+  useEffect(() => {
+    return () => {
+      if (hudTimeoutRef.current) window.clearTimeout(hudTimeoutRef.current);
+    };
+  }, []);
+
   // 是否正在加载下一批，避免并发请求
   const [loading, setLoading] = useState(false);
   // 后端报告"本轮已耗尽"，下次请求前会自动重置
@@ -211,11 +274,12 @@ export default function ShortsPage() {
     return () => observer.disconnect();
   }, [items.length]);
 
-  // 控制每个 video 的播放状态：只有 activeIndex 对应的在播
+  // 控制每个 video 的播放状态与音量：只有 activeIndex 对应的在播
   useEffect(() => {
     videoRefs.current.forEach((video, idx) => {
       if (idx === activeIndex) {
         video.muted = muted;
+        video.volume = volume;
         if (video.paused) {
           // 切到这个视频时从头开始播
           try {
@@ -234,7 +298,80 @@ export default function ShortsPage() {
         }
       }
     });
-  }, [activeIndex, muted, items.length]);
+  }, [activeIndex, muted, volume, items.length]);
+
+  // 键盘快捷键监听
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA")) {
+        return;
+      }
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        const nextIdx = activeIndex + 1;
+        if (nextIdx < items.length) {
+          const nextSlide = containerRef.current?.querySelector(`[data-index="${nextIdx}"]`);
+          if (nextSlide) {
+            nextSlide.scrollIntoView({ behavior: "smooth" });
+          }
+        }
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        const prevIdx = activeIndex - 1;
+        if (prevIdx >= 0) {
+          const prevSlide = containerRef.current?.querySelector(`[data-index="${prevIdx}"]`);
+          if (prevSlide) {
+            prevSlide.scrollIntoView({ behavior: "smooth" });
+          }
+        }
+      } else if (e.key === " ") {
+        e.preventDefault();
+        const activeVideo = videoRefs.current.get(activeIndex);
+        if (activeVideo) {
+          if (activeVideo.paused) {
+            activeVideo.play().catch(() => undefined);
+            showHud("播放", <Play size={16} fill="currentColor" />);
+          } else {
+            activeVideo.pause();
+            showHud("暂停", <Pause size={16} fill="currentColor" />);
+          }
+        }
+      } else if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        handleVolumeButtonClick();
+      } else if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        toggleFullscreen();
+      } else if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        const heartBtn = containerRef.current?.querySelector(`[data-index="${activeIndex}"] .shorts-slide__action`) as HTMLButtonElement | null;
+        if (heartBtn) {
+          heartBtn.click();
+        }
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        const activeVideo = videoRefs.current.get(activeIndex);
+        if (activeVideo && activeVideo.duration) {
+          const newTime = Math.min(activeVideo.duration, activeVideo.currentTime + 5);
+          activeVideo.currentTime = newTime;
+          showHud("+5秒", <Sparkles size={16} />);
+        }
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        const activeVideo = videoRefs.current.get(activeIndex);
+        if (activeVideo && activeVideo.duration) {
+          const newTime = Math.max(0, activeVideo.currentTime - 5);
+          activeVideo.currentTime = newTime;
+          showHud("-5秒", <Sparkles size={16} />);
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeIndex, items, toggleFullscreen, showHud, handleVolumeButtonClick]);
 
   // 页面卸载时暂停所有
   useEffect(() => {
@@ -397,6 +534,19 @@ export default function ShortsPage() {
     else requestPageFullscreen();
   }
 
+  const handleHideSuccess = useCallback((idx: number) => {
+    showHud("已选择不再展示，正在滑至下一首...", <EyeOff size={16} />);
+    const nextIdx = idx + 1;
+    if (nextIdx < items.length) {
+      setTimeout(() => {
+        const nextSlide = containerRef.current?.querySelector(`[data-index="${nextIdx}"]`);
+        if (nextSlide) {
+          nextSlide.scrollIntoView({ behavior: "smooth" });
+        }
+      }, 700);
+    }
+  }, [items.length, showHud]);
+
   return (
     <div className="shorts-page" ref={pageRef}>
       <header className="shorts-header">
@@ -412,16 +562,38 @@ export default function ShortsPage() {
           >
             {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
           </button>
-          <button
-            type="button"
-            className="shorts-header__icon-btn"
-            aria-label={muted ? "取消静音" : "静音"}
-            onClick={() => setMuted((v) => !v)}
-          >
-            {muted ? <VolumeX size={20} /> : <Volume2 size={20} />}
-          </button>
+          
+          <div className="shorts-header__volume-group">
+            <div className="shorts-header__volume-slider-container">
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={muted ? 0 : volume}
+                onChange={handleVolumeSliderChange}
+                className="shorts-header__volume-slider"
+                aria-label="音量调节"
+              />
+            </div>
+            <button
+              type="button"
+              className="shorts-header__icon-btn"
+              aria-label={muted ? "取消静音" : "静音"}
+              onClick={handleVolumeButtonClick}
+            >
+              {muted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+            </button>
+          </div>
         </div>
       </header>
+
+      {hudText && (
+        <div key={hudText.id} className="shorts-hud-toast">
+          {hudText.icon}
+          <span>{hudText.text}</span>
+        </div>
+      )}
 
       <div className="shorts-feed" ref={containerRef}>
         {empty && (
@@ -443,14 +615,22 @@ export default function ShortsPage() {
             // 其它槽位用海报占位以节省内存和带宽
             shouldMount={Math.abs(index - activeIndex) <= MOUNT_RADIUS}
             muted={muted}
+            volume={volume}
+            setMuted={setMuted}
+            setVolume={setVolume}
             videoRef={setVideoRef(index)}
             onLikeToggle={handleLikeToggle}
             hasLiked={hasLiked}
+            onHideSuccess={handleHideSuccess}
+            showHud={showHud}
           />
         ))}
 
         {!empty && items.length > 0 && loading && (
-          <div className="shorts-loading">加载中…</div>
+          <div className="shorts-loading">
+            <Loader2 size={16} className="shorts-slide__buffering-icon" />
+            <span>加载中…</span>
+          </div>
         )}
       </div>
     </div>
@@ -463,6 +643,9 @@ type SlideProps = {
   isActive: boolean;
   shouldMount: boolean;
   muted: boolean;
+  volume: number;
+  setMuted: (muted: boolean) => void;
+  setVolume: (volume: number) => void;
   videoRef: (el: HTMLVideoElement | null) => void;
   /**
    * 切换点赞。第二参数 true 表示点赞，false 表示取消。
@@ -471,6 +654,8 @@ type SlideProps = {
   onLikeToggle: (videoId: string, liked: boolean) => Promise<number | null>;
   /** 父组件查询某 id 是否已经在本次会话内点过赞 */
   hasLiked: (videoId: string) => boolean;
+  onHideSuccess: (index: number) => void;
+  showHud: (text: string, icon?: React.ReactNode) => void;
 };
 
 /**
@@ -486,13 +671,25 @@ function ShortsSlide({
   isActive,
   shouldMount,
   muted,
+  volume,
+  setMuted,
+  setVolume,
   videoRef,
   onLikeToggle,
   hasLiked,
+  onHideSuccess,
+  showHud,
 }: SlideProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
   const [paused, setPaused] = useState(false);
   const [fastActive, setFastActive] = useState(false);
+
+  // 视频缓冲状态
+  const [isBuffering, setIsBuffering] = useState(false);
+  // 单击播放暂停的瞬间 HUD 动效
+  const [playPauseHud, setPlayPauseHud] = useState<{ id: number; type: "play" | "pause" } | null>(null);
+  // 是否已经被隐藏/拉黑
+  const [isMarkedHidden, setIsMarkedHidden] = useState(false);
 
   // 进度状态。播放时由 timeupdate 更新；拖动时由用户输入更新
   const [duration, setDuration] = useState(0);
@@ -538,10 +735,32 @@ function ShortsSlide({
     if (!isActive) {
       setPaused(false);
       setScrubbing(false);
+      setIsBuffering(false);
+      setPlayPauseHud(null);
     }
   }, [isActive]);
 
-  // 监听 video 的时长 / 进度
+  // Sync volume state directly
+  useEffect(() => {
+    const video = localRef.current;
+    if (video && isActive) {
+      video.muted = muted;
+      video.volume = volume;
+    }
+  }, [muted, volume, isActive]);
+
+  // 离开活跃或者被隐藏时暂停视频
+  useEffect(() => {
+    if (isMarkedHidden && localRef.current) {
+      try {
+        localRef.current.pause();
+      } catch {
+        // ignore
+      }
+    }
+  }, [isMarkedHidden]);
+
+  // 监听 video 的时长 / 进度 / 缓冲状态 / 音量物理键变化
   useEffect(() => {
     const video = localRef.current;
     if (!video) return;
@@ -552,16 +771,47 @@ function ShortsSlide({
       // 拖动期间不要被 timeupdate 覆盖 UI
       if (!scrubbing) setCurrentTime(video.currentTime);
     };
+    const handleWaiting = () => {
+      setIsBuffering(true);
+    };
+    const handlePlayingOrCanPlay = () => {
+      setIsBuffering(false);
+    };
+    const handleVolumeChange = () => {
+      // 当检测到 video 自身的 mute 状态或 volume 改变时，同步更新 React 状态。
+      // 这可以在移动端浏览器支持物理音量键调整时，自动反向取消静音并展示音量 HUD。
+      if (video.muted !== muted) {
+        setMuted(video.muted);
+      }
+      if (video.volume !== volume) {
+        setVolume(video.volume);
+      }
+    };
+
     handleLoaded();
     video.addEventListener("loadedmetadata", handleLoaded);
     video.addEventListener("durationchange", handleLoaded);
     video.addEventListener("timeupdate", handleTime);
+    video.addEventListener("waiting", handleWaiting);
+    video.addEventListener("playing", handlePlayingOrCanPlay);
+    video.addEventListener("canplay", handlePlayingOrCanPlay);
+    video.addEventListener("volumechange", handleVolumeChange);
+
+    // 挂载时如果已经在播放但是状态不到 ready 则置 buffering
+    if (video.readyState < 3 && !video.paused) {
+      setIsBuffering(true);
+    }
+
     return () => {
       video.removeEventListener("loadedmetadata", handleLoaded);
       video.removeEventListener("durationchange", handleLoaded);
       video.removeEventListener("timeupdate", handleTime);
+      video.removeEventListener("waiting", handleWaiting);
+      video.removeEventListener("playing", handlePlayingOrCanPlay);
+      video.removeEventListener("canplay", handlePlayingOrCanPlay);
+      video.removeEventListener("volumechange", handleVolumeChange);
     };
-  }, [shouldMount, scrubbing]);
+  }, [shouldMount, scrubbing, muted, volume, setMuted, setVolume]);
 
   // 长按 2 倍速：直接绑原生事件
   useEffect(() => {
@@ -621,7 +871,6 @@ function ShortsSlide({
       video.removeEventListener("pause", end);
       video.removeEventListener("ended", end);
     };
-    // 仅当 video 元素重新挂载时重新绑定
   }, [shouldMount]);
 
   function togglePlayInternal() {
@@ -630,9 +879,13 @@ function ShortsSlide({
     if (video.paused) {
       video.play().catch(() => undefined);
       setPaused(false);
+      setPlayPauseHud({ id: Date.now(), type: "play" });
+      setTimeout(() => setPlayPauseHud(null), 450);
     } else {
       video.pause();
       setPaused(true);
+      setPlayPauseHud({ id: Date.now(), type: "pause" });
+      setTimeout(() => setPlayPauseHud(null), 450);
     }
   }
 
@@ -649,6 +902,9 @@ function ShortsSlide({
    * - 第二次点击（280ms 内）：清掉定时器，当作双击点赞，不切换播放状态
    */
   function handleSlideClick(e: React.MouseEvent<HTMLElement>) {
+    // 隐藏状态下不处理点击
+    if (isMarkedHidden) return;
+
     const now = Date.now();
     const delta = now - lastClickAtRef.current;
     lastClickAtRef.current = now;
@@ -698,7 +954,6 @@ function ShortsSlide({
 
   /**
    * 点击右下角心形按钮：在"已点赞 / 未点赞"之间切换。
-   * 已点赞 → 调 DELETE，likes -1；未点赞 → 调 POST，likes +1。
    */
   function handleHeartClick(e: React.MouseEvent<HTMLButtonElement>) {
     e.stopPropagation();
@@ -738,6 +993,29 @@ function ShortsSlide({
         }
       });
     }
+  }
+
+
+
+  /**
+   * 拉黑并隐藏视频
+   */
+  function handleHideClick(e: React.MouseEvent<HTMLButtonElement>) {
+    e.stopPropagation();
+    setIsMarkedHidden(true);
+    void hideVideo(item.id)
+      .then((res) => {
+        if (res.ok) {
+          onHideSuccess(index);
+        } else {
+          setIsMarkedHidden(false);
+          showHud("操作失败，请重试", <AlertCircle size={16} />);
+        }
+      })
+      .catch(() => {
+        setIsMarkedHidden(false);
+        showHud("网络请求出错", <AlertCircle size={16} />);
+      });
   }
 
   // ---- 进度条拖动 ----
@@ -800,6 +1078,7 @@ function ShortsSlide({
       className="shorts-slide"
       data-shorts-slide=""
       data-index={index}
+      data-active={isActive}
       onClick={handleSlideClick}
     >
       {/* 模糊海报背景：避免横屏视频两边出现刺眼黑边 */}
@@ -835,13 +1114,38 @@ function ShortsSlide({
 
       {fastActive && (
         <div className="shorts-slide__rate-hint" aria-hidden="true">
-          2x
+          2x 速播放中
         </div>
       )}
 
-      {paused && isActive && !scrubbing && (
+
+
+      {paused && isActive && !scrubbing && !playPauseHud && (
         <div className="shorts-slide__paused" aria-hidden="true">
           ▶
+        </div>
+      )}
+
+      {/* 视频加载/缓冲旋转器 */}
+      {isBuffering && isActive && shouldMount && !isMarkedHidden && (
+        <div className="shorts-slide__buffering" aria-hidden="true">
+          <Loader2 size={30} className="shorts-slide__buffering-icon" />
+        </div>
+      )}
+
+      {/* 播放暂停瞬间 HUD 动效 */}
+      {playPauseHud && isActive && (
+        <div key={playPauseHud.id} className="shorts-slide__hud-pulse" aria-hidden="true">
+          {playPauseHud.type === "play" ? <Play size={30} fill="currentColor" /> : <Pause size={30} fill="currentColor" />}
+        </div>
+      )}
+
+      {/* 不再展示屏蔽遮罩 */}
+      {isMarkedHidden && (
+        <div className="shorts-slide__hidden-overlay" onClick={(e) => e.stopPropagation()}>
+          <EyeOff size={38} style={{ color: "#ff4060", marginBottom: "8px" }} />
+          <div className="shorts-slide__hidden-title">已隐藏该视频</div>
+          <div className="shorts-slide__hidden-desc">系统将不会再次在任何地方向您展示此视频</div>
         </div>
       )}
 
@@ -860,29 +1164,52 @@ function ShortsSlide({
             </span>
           )}
         </div>
+        <Link
+          to={`/video/${encodeURIComponent(item.id)}`}
+          className="shorts-slide__detail"
+        >
+          <Info size={13} />
+          <span>查看详情</span>
+        </Link>
       </div>
 
-      {/* 右下角操作栏（TikTok 式垂直排布）。当前只有点赞，
-         保持竖排结构方便后续加收藏/分享/评论。 */}
+      {/* 右下角操作栏 */}
       <aside
         className="shorts-slide__actions"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* 云盘来源徽章 */}
+        <div className="shorts-drive-badge" title={`来源: ${item.sourceLabel || "本地"}`}>
+          {getDriveShortName(item.sourceLabel || "本地")}
+        </div>
+
+        {/* 点赞 */}
         <button
           type="button"
-          className={`shorts-slide__action ${
-            isLiked ? "is-liked" : ""
-          }`}
+          className={`shorts-slide__action ${isLiked ? "is-liked" : ""}`}
           aria-label={isLiked ? "取消点赞" : "点赞"}
           aria-pressed={isLiked}
           onClick={handleHeartClick}
         >
           <Heart
-            size={28}
+            size={24}
             fill={isLiked ? "currentColor" : "none"}
             strokeWidth={2}
           />
           <span className="shorts-slide__action-count">{formatCount(likes)}</span>
+        </button>
+
+
+
+        {/* 不再展示 */}
+        <button
+          type="button"
+          className="shorts-slide__action"
+          aria-label="不再展示"
+          onClick={handleHideClick}
+        >
+          <EyeOff size={22} />
+          <span className="shorts-slide__action-count">隐藏</span>
         </button>
       </aside>
 
@@ -898,10 +1225,8 @@ function ShortsSlide({
         </div>
       )}
 
-      {/* 进度条：默认隐藏（仅一根细线），用户按到底部约 32px 区域时才"激活"
-         成可拖动的高对比进度条。靠 pointer events 自己实现拖拽，
-         不需要 input[type=range] 那种鼠标点击行为。 */}
-      {shouldMount && (
+      {/* 进度条 */}
+      {shouldMount && !isMarkedHidden && (
         <div
           className={`shorts-slide__progress ${
             scrubbing ? "is-scrubbing" : ""
@@ -912,7 +1237,12 @@ function ShortsSlide({
           onPointerCancel={handleProgressPointerEnd}
           onClick={(e) => e.stopPropagation()}
         >
-          <div className="shorts-slide__progress-track">
+          <div
+            className="shorts-slide__progress-track"
+            style={{
+              "--progress-pct": `${progressRatio * 100}%`,
+            } as React.CSSProperties}
+          >
             <div
               className="shorts-slide__progress-fill"
               style={{ width: `${progressRatio * 100}%` }}
@@ -947,4 +1277,16 @@ function formatCount(n: number) {
   if (n < 1000) return String(n);
   if (n < 10000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
   return (n / 10000).toFixed(1).replace(/\.0$/, "") + "w";
+}
+
+/** 识别云盘缩写名称 */
+function getDriveShortName(source: string): string {
+  const s = source.toLowerCase();
+  if (s.includes("115")) return "115";
+  if (s.includes("pikpak")) return "PikP";
+  if (s.includes("quark") || s.includes("夸克")) return "Quak";
+  if (s.includes("onedrive")) return "OneDrive";
+  if (s.includes("wopan") || s.includes("沃盘")) return "沃盘";
+  if (s.includes("spider") || s.includes("爬虫")) return "爬虫";
+  return source.substring(0, 4);
 }
