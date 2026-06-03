@@ -41,7 +41,7 @@ test("spider91 upload target uses explicit local-save option instead of auto tar
 });
 
 test("drive form hides root directory id for localstorage and spider91", () => {
-  assert.match(combinedSource, /<label>根目录 ID<\/label>/);
+  assert.match(combinedSource, /<label[^>]*>根目录 ID<\/label>/);
   assert.match(
     combinedSource,
     /usesRootDirectoryID\(kind:\s*Kind\):\s*boolean\s*\{\s*return kind !== "localstorage" && kind !== "spider91";\s*\}/
