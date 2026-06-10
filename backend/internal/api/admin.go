@@ -22,6 +22,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
+	"github.com/video-site/backend/internal/drives/spider91"
 )
 
 type AdminServer struct {
@@ -630,6 +631,7 @@ type crawlerDTO struct {
 	ScriptPath                  string           `json:"scriptPath"`
 	Proxy                       string           `json:"proxy,omitempty"`
 	TargetNew                   string           `json:"targetNew,omitempty"`
+	UploadDriveID               string           `json:"uploadDriveId,omitempty"`
 	LastCrawlAt                 int64            `json:"lastCrawlAt,omitempty"`
 	ScanGenerationStatus        GenerationStatus `json:"scanGenerationStatus"`
 	ThumbnailGenerationStatus   GenerationStatus `json:"thumbnailGenerationStatus"`
@@ -644,32 +646,21 @@ type crawlerDTO struct {
 	FingerprintReadyCount       int              `json:"fingerprintReadyCount"`
 	FingerprintPendingCount     int              `json:"fingerprintPendingCount"`
 	FingerprintFailedCount      int              `json:"fingerprintFailedCount"`
+	TotalCrawledCount           int              `json:"totalCrawledCount"`
+	LocalVideoCount             int              `json:"localVideoCount"`
+	MigratedVideoCount          int              `json:"migratedVideoCount"`
 }
 
 type upsertCrawlerReq struct {
-	ID         string `json:"id"`
-	ScriptPath string `json:"scriptPath"`
-	Proxy      string `json:"proxy"`
-	TargetNew  string `json:"targetNew"`
+	ID            string `json:"id"`
+	ScriptPath    string `json:"scriptPath"`
+	Proxy         string `json:"proxy"`
+	TargetNew     string `json:"targetNew"`
+	UploadDriveID string `json:"uploadDriveId"`
 }
 
 func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request) {
 	all, err := a.Catalog.ListDrives(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	teaserCounts, err := a.Catalog.CountTeasersByDrive(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	thumbnailCounts, err := a.Catalog.CountThumbnailsByDrive(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	fingerprintCounts, err := a.Catalog.CountFingerprintsByDrive(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -684,12 +675,17 @@ func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request)
 		if d == nil || !isConfiguredCrawlerDrive(d) {
 			continue
 		}
-		out = append(out, a.crawlerDTOForDrive(d, teaserCounts[d.ID], thumbnailCounts[d.ID], fingerprintCounts[d.ID], generationStatuses[d.ID]))
+		assetCounts, err := a.Catalog.CountCrawlerAssets(r.Context(), d.ID, crawlerVideoIDPrefixes(d))
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		out = append(out, a.crawlerDTOForDrive(d, assetCounts, generationStatuses[d.ID]))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, teaser catalog.DriveTeaserCounts, thumb catalog.DriveThumbnailCounts, fp catalog.DriveFingerprintCounts, generation DriveGenerationStatuses) crawlerDTO {
+func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.CrawlerAssetCounts, generation DriveGenerationStatuses) crawlerDTO {
 	if generation.Scan.State == "" {
 		generation.Scan.State = "idle"
 	}
@@ -717,20 +713,34 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, teaser catalog.DriveT
 		ScriptPath:                  strings.TrimSpace(d.Credentials["script_path"]),
 		Proxy:                       strings.TrimSpace(d.Credentials["proxy"]),
 		TargetNew:                   strings.TrimSpace(d.Credentials["target_new"]),
+		UploadDriveID:               strings.TrimSpace(d.Credentials["upload_drive_id"]),
 		LastCrawlAt:                 lastCrawlAt,
 		ScanGenerationStatus:        generation.Scan,
 		ThumbnailGenerationStatus:   generation.Thumbnail,
 		PreviewGenerationStatus:     generation.Preview,
 		FingerprintGenerationStatus: generation.Fingerprint,
-		ThumbnailReadyCount:         thumb.Ready,
-		ThumbnailPendingCount:       thumb.Pending,
-		ThumbnailFailedCount:        thumb.Failed,
-		TeaserReadyCount:            teaser.Ready,
-		TeaserPendingCount:          teaser.Pending,
-		TeaserFailedCount:           teaser.Failed,
-		FingerprintReadyCount:       fp.Ready,
-		FingerprintPendingCount:     fp.Pending,
-		FingerprintFailedCount:      fp.Failed,
+		ThumbnailReadyCount:         assets.Thumbnail.Ready,
+		ThumbnailPendingCount:       assets.Thumbnail.Pending,
+		ThumbnailFailedCount:        assets.Thumbnail.Failed,
+		TeaserReadyCount:            assets.Teaser.Ready,
+		TeaserPendingCount:          assets.Teaser.Pending,
+		TeaserFailedCount:           assets.Teaser.Failed,
+		FingerprintReadyCount:       assets.Fingerprint.Ready,
+		FingerprintPendingCount:     assets.Fingerprint.Pending,
+		FingerprintFailedCount:      assets.Fingerprint.Failed,
+		TotalCrawledCount:           assets.Total,
+		LocalVideoCount:             assets.Local,
+		MigratedVideoCount:          assets.Migrated,
+	}
+}
+
+func crawlerVideoIDPrefixes(d *catalog.Drive) []string {
+	if d == nil {
+		return nil
+	}
+	return []string{
+		scriptcrawler.Kind + "-" + d.ID + "-",
+		spider91.Kind + "-" + d.ID + "-",
 	}
 }
 
@@ -765,12 +775,17 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 	}
 	scriptPath := strings.TrimSpace(body.ScriptPath)
 	incoming := map[string]string{
-		"script_path": scriptPath,
-		"proxy":       strings.TrimSpace(body.Proxy),
-		"target_new":  strings.TrimSpace(body.TargetNew),
+		"script_path":     scriptPath,
+		"proxy":           strings.TrimSpace(body.Proxy),
+		"target_new":      strings.TrimSpace(body.TargetNew),
+		"upload_drive_id": strings.TrimSpace(body.UploadDriveID),
 	}
 	for k, v := range incoming {
 		creds[k] = v
+	}
+	if err := a.validateCrawlerUploadDrive(r.Context(), creds["upload_drive_id"]); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	merged, err := mergeScriptCrawlerCredentials(existing, creds)
 	if err != nil {
@@ -841,6 +856,33 @@ func (a *AdminServer) generateCrawlerID(ctx context.Context, name string) (strin
 		candidate = fmt.Sprintf("%s-%d", base, suffix)
 	}
 	return candidate, nil
+}
+
+func (a *AdminServer) validateCrawlerUploadDrive(ctx context.Context, driveID string) error {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" {
+		return nil
+	}
+	if a == nil || a.Catalog == nil {
+		return errors.New("crawler upload target validation unavailable")
+	}
+	d, err := a.Catalog.GetDrive(ctx, driveID)
+	if err != nil || d == nil {
+		return fmt.Errorf("上传目标网盘 %q 不存在", driveID)
+	}
+	if !isCrawlerUploadTargetKind(d.Kind) {
+		return fmt.Errorf("上传目标网盘 %q 类型为 %s，仅支持 115网盘、PikPak、123网盘、Google Drive、OneDrive", driveID, d.Kind)
+	}
+	return nil
+}
+
+func isCrawlerUploadTargetKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "p115", "pikpak", "p123", "googledrive", "onedrive":
+		return true
+	default:
+		return false
+	}
 }
 
 func crawlerIDSlug(raw string) string {

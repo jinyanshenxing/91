@@ -421,6 +421,85 @@ func TestRunSpider91MigrationAfterManualCrawlRequiresConfiguredUploadTarget(t *t
 	}
 }
 
+func TestScheduleCrawlerUploadMigrationRunsForConfiguredCrawler(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "crawler-truvaze",
+		Kind:   scriptcrawler.Kind,
+		Name:   "Truvaze",
+		RootID: "/",
+		Credentials: map[string]string{
+			"script_path":     "/tmp/Truvaze.py",
+			"upload_drive_id": "pikpak",
+		},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+	registry := proxy.NewRegistry()
+	registry.Set("crawler-truvaze", &serverFakeKindDrive{id: "crawler-truvaze", kind: scriptcrawler.Kind})
+	migrator := &serverFakeSpider91MigrationRunner{}
+	app := &App{
+		cat:                cat,
+		registry:           registry,
+		spider91Migrator:   migrator,
+		workers:            map[string]*preview.Worker{},
+		thumbWorkers:       map[string]*preview.ThumbWorker{},
+		fingerprintWorkers: map[string]*fingerprint.Worker{},
+	}
+
+	if !app.scheduleCrawlerUploadMigration(ctx, "crawler-truvaze") {
+		t.Fatal("scheduleCrawlerUploadMigration returned false, want true")
+	}
+	deadline := time.After(time.Second)
+	for migrator.called == 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("migration calls = %d, want 1", migrator.called)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestScheduleCrawlerUploadMigrationSkipsWithoutUploadTarget(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:          "crawler-local",
+		Kind:        scriptcrawler.Kind,
+		Name:        "Local Only",
+		RootID:      "/",
+		Credentials: map[string]string{"script_path": "/tmp/local.py"},
+	}); err != nil {
+		t.Fatalf("seed crawler: %v", err)
+	}
+	migrator := &serverFakeSpider91MigrationRunner{}
+	app := &App{cat: cat, registry: proxy.NewRegistry(), spider91Migrator: migrator}
+
+	if app.scheduleCrawlerUploadMigration(ctx, "crawler-local") {
+		t.Fatal("scheduleCrawlerUploadMigration returned true without upload target")
+	}
+	if migrator.called != 0 {
+		t.Fatalf("migration calls = %d, want 0", migrator.called)
+	}
+}
+
 func TestDriveGenerationStatusUsesWorkerQueueNotPendingCatalogRows(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")

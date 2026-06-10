@@ -20,6 +20,15 @@ type Catalog struct {
 	db *sql.DB
 }
 
+type CrawlerAssetCounts struct {
+	Total       int
+	Local       int
+	Migrated    int
+	Thumbnail   DriveThumbnailCounts
+	Teaser      DriveTeaserCounts
+	Fingerprint DriveFingerprintCounts
+}
+
 func Open(path string) (*Catalog, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
@@ -1453,6 +1462,121 @@ func (c *Catalog) CountFingerprintsByDrive(ctx context.Context) (map[string]Driv
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *Catalog) CountCrawlerAssets(ctx context.Context, crawlerID string, prefixes []string) (CrawlerAssetCounts, error) {
+	var out CrawlerAssetCounts
+	crawlerID = strings.TrimSpace(crawlerID)
+	prefixes = cleanCrawlerIDPrefixes(prefixes)
+	if crawlerID == "" || len(prefixes) == 0 {
+		return out, nil
+	}
+
+	where := make([]string, 0, len(prefixes))
+	args := make([]any, 0, 2+len(prefixes))
+	args = append(args, crawlerID, crawlerID)
+	for range prefixes {
+		where = append(where, "id LIKE ? ESCAPE '\\'")
+	}
+	for _, prefix := range prefixes {
+		args = append(args, escapeSQLLike(prefix)+"%")
+	}
+	query := `SELECT
+		        COUNT(*) AS total_count,
+		        COUNT(CASE WHEN drive_id = ? THEN 1 END) AS local_count,
+		        COUNT(CASE WHEN drive_id != ? THEN 1 END) AS migrated_count,
+		        COUNT(CASE WHEN EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.thumbnail_url, '') != ''
+		                  ) THEN 1 END) AS thumbnail_ready_count,
+		        COUNT(CASE WHEN NOT EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.thumbnail_url, '') != ''
+		                  )
+		                     AND COALESCE(thumbnail_url, '') = ''
+		                     AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped') THEN 1 END) AS thumbnail_pending_count,
+		        COUNT(CASE WHEN NOT EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.thumbnail_url, '') != ''
+		                  )
+		                     AND COALESCE(thumbnail_url, '') = ''
+		                     AND COALESCE(thumbnail_status, 'pending') = 'failed' THEN 1 END) AS thumbnail_failed_count,
+		        COUNT(CASE WHEN EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.preview_status, 'pending') = 'ready'
+		                  ) THEN 1 END) AS teaser_ready_count,
+		        COUNT(CASE WHEN NOT EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.preview_status, 'pending') = 'ready'
+		                  )
+		                     AND COALESCE(preview_status, 'pending') = 'pending' THEN 1 END) AS teaser_pending_count,
+		        COUNT(CASE WHEN NOT EXISTS (
+		                     SELECT 1 FROM videos AS asset_dup
+		                      WHERE ` + crawlerAssetEquivalentSQL("asset_dup", "videos") + `
+		                        AND COALESCE(asset_dup.preview_status, 'pending') = 'ready'
+		                  )
+		                     AND COALESCE(preview_status, 'pending') = 'failed' THEN 1 END) AS teaser_failed_count,
+		        COUNT(CASE WHEN COALESCE(sampled_sha256, '') != ''
+		                      OR COALESCE(fingerprint_status, 'pending') = 'ready' THEN 1 END) AS fingerprint_ready_count,
+		        COUNT(CASE WHEN size_bytes > 0
+		                     AND COALESCE(sampled_sha256, '') = ''
+		                     AND COALESCE(fingerprint_status, 'pending') = 'pending' THEN 1 END) AS fingerprint_pending_count,
+		        COUNT(CASE WHEN COALESCE(sampled_sha256, '') = ''
+		                     AND COALESCE(fingerprint_status, 'pending') = 'failed' THEN 1 END) AS fingerprint_failed_count
+		   FROM videos
+		  WHERE COALESCE(hidden, 0) = 0
+		    AND (` + strings.Join(where, " OR ") + `)`
+	err := c.db.QueryRowContext(ctx, query, args...).Scan(
+		&out.Total,
+		&out.Local,
+		&out.Migrated,
+		&out.Thumbnail.Ready,
+		&out.Thumbnail.Pending,
+		&out.Thumbnail.Failed,
+		&out.Teaser.Ready,
+		&out.Teaser.Pending,
+		&out.Teaser.Failed,
+		&out.Fingerprint.Ready,
+		&out.Fingerprint.Pending,
+		&out.Fingerprint.Failed,
+	)
+	return out, err
+}
+
+func crawlerAssetEquivalentSQL(candidateAlias, sourceAlias string) string {
+	return fmt.Sprintf(`(%[1]s.id = %[2]s.id
+		OR (COALESCE(%[2]s.content_hash, '') != ''
+		    AND %[1]s.content_hash = %[2]s.content_hash)
+		OR (%[2]s.size_bytes > 0
+		    AND COALESCE(%[2]s.sampled_sha256, '') != ''
+		    AND %[1]s.size_bytes = %[2]s.size_bytes
+		    AND %[1]s.sampled_sha256 = %[2]s.sampled_sha256))`, candidateAlias, sourceAlias)
+}
+
+func cleanCrawlerIDPrefixes(prefixes []string) []string {
+	out := make([]string, 0, len(prefixes))
+	seen := map[string]bool{}
+	for _, prefix := range prefixes {
+		prefix = strings.TrimSpace(prefix)
+		if prefix == "" || seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		out = append(out, prefix)
+	}
+	return out
+}
+
+func escapeSQLLike(raw string) string {
+	raw = strings.ReplaceAll(raw, `\`, `\\`)
+	raw = strings.ReplaceAll(raw, `%`, `\%`)
+	raw = strings.ReplaceAll(raw, `_`, `\_`)
+	return raw
 }
 
 func (c *Catalog) CountVideosNeedingFingerprint(ctx context.Context, driveID string) (int, error) {

@@ -880,12 +880,21 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 			Name:   "91 Spider",
 			RootID: "/",
 			Credentials: map[string]string{
-				"builtin":       "spider91",
-				"last_crawl_at": "1800000000",
-				"proxy":         " http://127.0.0.1:7890 ",
-				"script_path":   scriptPath,
+				"builtin":         "spider91",
+				"last_crawl_at":   "1800000000",
+				"proxy":           " http://127.0.0.1:7890 ",
+				"script_path":     scriptPath,
+				"upload_drive_id": "p115-target",
 			},
 			Status: "ok",
+		},
+		{
+			ID:          "p115-target",
+			Kind:        "p115",
+			Name:        "115",
+			RootID:      "0",
+			Credentials: map[string]string{"cookie": "x"},
+			Status:      "ok",
 		},
 		{
 			ID:     "onedrive-main",
@@ -910,6 +919,41 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 			t.Fatalf("seed drive %s: %v", d.ID, err)
 		}
 	}
+	for _, v := range []*catalog.Video{
+		{
+			ID:              "spider91-crawler-spider91-local",
+			DriveID:         "crawler-spider91",
+			FileID:          "local.mp4",
+			FileName:        "local.mp4",
+			Title:           "Local",
+			Size:            123,
+			Ext:             "mp4",
+			ThumbnailURL:    "/p/thumb/spider91-crawler-spider91-local",
+			PreviewStatus:   "ready",
+			DurationSeconds: 12,
+			PublishedAt:     time.Now(),
+		},
+		{
+			ID:              "scriptcrawler-crawler-spider91-migrated",
+			DriveID:         "p115-target",
+			FileID:          "uploaded-id",
+			FileName:        "migrated.mp4",
+			Title:           "Migrated",
+			Size:            456,
+			Ext:             "mp4",
+			ThumbnailURL:    "/p/thumb/scriptcrawler-crawler-spider91-migrated",
+			PreviewStatus:   "ready",
+			DurationSeconds: 34,
+			PublishedAt:     time.Now(),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, v); err != nil {
+			t.Fatalf("seed crawler video %s: %v", v.ID, err)
+		}
+		if err := cat.UpdateVideoFingerprint(ctx, v.ID, "sha-"+v.ID, "ready", ""); err != nil {
+			t.Fatalf("seed crawler fingerprint %s: %v", v.ID, err)
+		}
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/crawlers", nil)
 	rr := httptest.NewRecorder()
@@ -920,28 +964,61 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	}
 
 	var got []struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		Kind        string `json:"kind"`
-		Proxy       string `json:"proxy"`
-		LastCrawlAt int64  `json:"lastCrawlAt"`
+		ID               string `json:"id"`
+		Name             string `json:"name"`
+		Kind             string `json:"kind"`
+		Proxy            string `json:"proxy"`
+		UploadDriveID    string `json:"uploadDriveId"`
+		LastCrawlAt      int64  `json:"lastCrawlAt"`
+		TotalCrawled     int    `json:"totalCrawledCount"`
+		LocalVideos      int    `json:"localVideoCount"`
+		MigratedVideo    int    `json:"migratedVideoCount"`
+		ThumbnailReady   int    `json:"thumbnailReadyCount"`
+		TeaserReady      int    `json:"teaserReadyCount"`
+		FingerprintReady int    `json:"fingerprintReadyCount"`
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	byID := map[string]struct {
-		Name        string
-		Kind        string
-		Proxy       string
-		LastCrawlAt int64
+		Name             string
+		Kind             string
+		Proxy            string
+		UploadDriveID    string
+		LastCrawlAt      int64
+		TotalCrawled     int
+		LocalVideos      int
+		MigratedVideo    int
+		ThumbnailReady   int
+		TeaserReady      int
+		FingerprintReady int
 	}{}
 	for _, d := range got {
 		byID[d.ID] = struct {
-			Name        string
-			Kind        string
-			Proxy       string
-			LastCrawlAt int64
-		}{Name: d.Name, Kind: d.Kind, Proxy: d.Proxy, LastCrawlAt: d.LastCrawlAt}
+			Name             string
+			Kind             string
+			Proxy            string
+			UploadDriveID    string
+			LastCrawlAt      int64
+			TotalCrawled     int
+			LocalVideos      int
+			MigratedVideo    int
+			ThumbnailReady   int
+			TeaserReady      int
+			FingerprintReady int
+		}{
+			Name:             d.Name,
+			Kind:             d.Kind,
+			Proxy:            d.Proxy,
+			UploadDriveID:    d.UploadDriveID,
+			LastCrawlAt:      d.LastCrawlAt,
+			TotalCrawled:     d.TotalCrawled,
+			LocalVideos:      d.LocalVideos,
+			MigratedVideo:    d.MigratedVideo,
+			ThumbnailReady:   d.ThumbnailReady,
+			TeaserReady:      d.TeaserReady,
+			FingerprintReady: d.FingerprintReady,
+		}
 	}
 	if _, ok := byID["spider91-main"]; ok {
 		t.Fatal("legacy spider91 drive should not be returned by crawler list")
@@ -958,8 +1035,17 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	if byID["crawler-spider91"].Proxy != "http://127.0.0.1:7890" {
 		t.Fatalf("crawler proxy = %q, want trimmed proxy", byID["crawler-spider91"].Proxy)
 	}
+	if byID["crawler-spider91"].UploadDriveID != "p115-target" {
+		t.Fatalf("uploadDriveId = %q, want p115-target", byID["crawler-spider91"].UploadDriveID)
+	}
 	if byID["crawler-spider91"].LastCrawlAt != 1800000000 {
 		t.Fatalf("lastCrawlAt = %d, want 1800000000", byID["crawler-spider91"].LastCrawlAt)
+	}
+	if byID["crawler-spider91"].TotalCrawled != 2 || byID["crawler-spider91"].LocalVideos != 1 || byID["crawler-spider91"].MigratedVideo != 1 {
+		t.Fatalf("crawler counts = total %d local %d migrated %d, want 2/1/1", byID["crawler-spider91"].TotalCrawled, byID["crawler-spider91"].LocalVideos, byID["crawler-spider91"].MigratedVideo)
+	}
+	if byID["crawler-spider91"].ThumbnailReady != 2 || byID["crawler-spider91"].TeaserReady != 2 || byID["crawler-spider91"].FingerprintReady != 2 {
+		t.Fatalf("asset ready counts = thumb %d teaser %d fingerprint %d, want 2/2/2", byID["crawler-spider91"].ThumbnailReady, byID["crawler-spider91"].TeaserReady, byID["crawler-spider91"].FingerprintReady)
 	}
 	if _, ok := byID["onedrive-main"]; ok {
 		t.Fatal("onedrive should not be returned by crawler list")
@@ -1105,6 +1191,62 @@ func TestHandleUpsertCrawlerGeneratesIDFromScriptName(t *testing.T) {
 	}
 	if got.Name != "My Spider" || got.Kind != scriptcrawler.Kind {
 		t.Fatalf("generated crawler = %+v", got)
+	}
+}
+
+func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	scriptPath := filepath.Join(tmp, "custom.py")
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Upload Spider\"\n"), 0o644); err != nil {
+		t.Fatalf("write crawler script: %v", err)
+	}
+	for _, d := range []*catalog.Drive{
+		{ID: "p115-target", Kind: "p115", Name: "115", RootID: "0", Credentials: map[string]string{"cookie": "x"}},
+		{ID: "local-target", Kind: "localstorage", Name: "Local", RootID: "/", Credentials: map[string]string{"path": tmp}},
+	} {
+		if err := cat.UpsertDrive(ctx, d); err != nil {
+			t.Fatalf("seed drive %s: %v", d.ID, err)
+		}
+	}
+	srv := &AdminServer{Catalog: cat}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
+		"id": "crawler-upload",
+		"scriptPath": "`+scriptPath+`",
+		"uploadDriveId": "p115-target"
+	}`))
+	rr := httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "crawler-upload")
+	if err != nil {
+		t.Fatalf("get crawler: %v", err)
+	}
+	if got.Credentials["upload_drive_id"] != "p115-target" {
+		t.Fatalf("upload_drive_id = %q, want p115-target", got.Credentials["upload_drive_id"])
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
+		"id": "crawler-upload",
+		"scriptPath": "`+scriptPath+`",
+		"uploadDriveId": "local-target"
+	}`))
+	rr = httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid target status = %d, body = %s, want 400", rr.Code, rr.Body.String())
 	}
 }
 

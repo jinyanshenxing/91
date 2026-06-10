@@ -1,212 +1,108 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type ReactNode,
+} from "react";
 import {
   Activity,
-  ArrowLeft,
-  ChevronRight,
+  AlertTriangle,
+  ChevronDown,
   CircleStop,
-  Clock,
   Download,
   FileCode2,
-  Gauge,
   Link as LinkIcon,
+  Pencil,
   Plus,
   RefreshCw,
-  Save,
-  Settings2,
   TestTube,
   Trash2,
   Upload,
 } from "lucide-react";
 import * as api from "./api";
+import { Modal } from "./Modal";
+import { ConfirmModal } from "./ConfirmModal";
 import { useToast } from "./ToastContext";
 import { generationStateClass, generationStateLabel } from "./drive/constants";
+import { Spider91UploadTargetField } from "./drive/Spider91UploadTargetField";
 import { SpiderIcon } from "./icons/SpiderIcon";
 
-type CrawlerForm = {
-  id: string;
-  name: string;
-  scriptPath: string;
-  targetNew: string;
-  proxy: string;
-};
+const BUSY_STATES = new Set(["scanning", "generating", "queued"]);
+const POLL_INTERVAL_MS = 5000;
+const UPLOAD_TARGET_KINDS = new Set(["p115", "pikpak", "p123", "googledrive", "onedrive"]);
 
-const emptyForm: CrawlerForm = {
-  id: "",
-  name: "",
-  scriptPath: "",
-  targetNew: "10",
-  proxy: "",
-};
+function statusBusy(status?: api.DriveGenerationStatus) {
+  return BUSY_STATES.has(status?.state ?? "");
+}
+
+function crawlerBusy(crawler: api.AdminCrawler) {
+  return (
+    statusBusy(crawler.scanGenerationStatus) ||
+    statusBusy(crawler.thumbnailGenerationStatus) ||
+    statusBusy(crawler.previewGenerationStatus) ||
+    statusBusy(crawler.fingerprintGenerationStatus)
+  );
+}
 
 export function CrawlersPage() {
   const [list, setList] = useState<api.AdminCrawler[]>([]);
-  const [selectedId, setSelectedId] = useState("");
-  const [form, setForm] = useState<CrawlerForm>(emptyForm);
+  const [uploadTargets, setUploadTargets] = useState<api.AdminDrive[]>([]);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [expandedId, setExpandedId] = useState("");
   const [runningId, setRunningId] = useState("");
   const [stoppingId, setStoppingId] = useState("");
-  const [scriptURL, setScriptURL] = useState("");
-  const [importingScript, setImportingScript] = useState(false);
-  const [testingScript, setTestingScript] = useState(false);
-  const [testResult, setTestResult] = useState<api.CrawlerDryRunResult | null>(null);
-  const [mode, setMode] = useState<"list" | "detail">("list");
+  // undefined = 编辑器关闭；null = 新建；其余 = 编辑已有爬虫
+  const [editorTarget, setEditorTarget] = useState<api.AdminCrawler | null | undefined>(undefined);
+  const [deleteTarget, setDeleteTarget] = useState<api.AdminCrawler | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const refreshingRef = useRef(false);
   const { show } = useToast();
 
-  const selected = useMemo(
-    () => list.find((item) => item.id === selectedId) ?? null,
-    [list, selectedId]
+  const refresh = useCallback(
+    async (silent = false) => {
+      if (refreshingRef.current) return;
+      refreshingRef.current = true;
+      if (!silent) setLoading(true);
+      try {
+        const [data, drives] = await Promise.all([api.listCrawlers(), api.listDrives()]);
+        setList(data);
+        setUploadTargets(drives.filter((d) => UPLOAD_TARGET_KINDS.has(d.kind)));
+      } catch (e) {
+        if (!silent) show(e instanceof Error ? e.message : "加载爬虫失败", "error");
+      } finally {
+        refreshingRef.current = false;
+        if (!silent) setLoading(false);
+      }
+    },
+    [show]
   );
-  const stats = useMemo(() => {
-    const running = list.filter((item) => item.scanGenerationStatus?.state === "scanning").length;
-    return {
-      total: list.length,
-      ready: list.filter((item) => item.status === "ok").length,
-      running,
-      error: list.filter((item) => item.status === "error").length,
-    };
-  }, [list]);
-
-  async function refresh() {
-    setLoading(true);
-    try {
-      const data = await api.listCrawlers();
-      setList(data);
-    } catch (e) {
-      show(e instanceof Error ? e.message : "加载爬虫失败", "error");
-    } finally {
-      setLoading(false);
-    }
-  }
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
-  function selectCrawler(crawler: api.AdminCrawler) {
-    setSelectedId(crawler.id);
-    setMode("detail");
-    setTestResult(null);
-    setForm({
-      id: crawler.id,
-      name: crawler.name,
-      scriptPath: crawler.scriptPath ?? "",
-      targetNew: crawler.targetNew || "10",
-      proxy: crawler.proxy ?? "",
-    });
-  }
+  // 有任务进行中时自动轮询，页面切到后台时暂停
+  const anyBusy = useMemo(() => list.some(crawlerBusy), [list]);
+  useEffect(() => {
+    if (!anyBusy) return;
+    const timer = window.setInterval(() => {
+      if (!document.hidden) refresh(true);
+    }, POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [anyBusy, refresh]);
 
-  function createCustom() {
-    setSelectedId("");
-    setForm(emptyForm);
-    setScriptURL("");
-    setTestResult(null);
-    setMode("detail");
-  }
-
-  function backToList() {
-    setSelectedId("");
-    setForm(emptyForm);
-    setScriptURL("");
-    setTestResult(null);
-    setMode("list");
-  }
-
-  function set<K extends keyof CrawlerForm>(key: K, value: CrawlerForm[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
-  }
-
-  async function save() {
-    const id = form.id.trim();
-    if (!form.scriptPath.trim()) {
-      show("请先导入爬虫脚本", "error");
-      return;
-    }
-    setSaving(true);
-    try {
-      const resp = await api.upsertCrawler({
-        id: id || undefined,
-        scriptPath: form.scriptPath.trim(),
-        targetNew: form.targetNew.trim(),
-        proxy: form.proxy.trim(),
-      });
-      if (resp.warning) {
-        show(`已保存，但初始化失败：${resp.warning}`, "error");
-      } else {
-        show("已保存", "success");
-      }
-      setSelectedId(resp.id || id);
-      await refresh();
-      setMode("list");
-    } catch (e) {
-      show(e instanceof Error ? e.message : "保存失败", "error");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function importScriptFile(file: File | null | undefined) {
-    if (!file) return;
-    setImportingScript(true);
-    try {
-      const resp = await api.importCrawlerScriptFile(file);
-      set("scriptPath", resp.scriptPath);
-      set("name", resp.name);
-      setTestResult(null);
-      show("脚本已导入", "success");
-    } catch (e) {
-      show(e instanceof Error ? e.message : "导入失败", "error");
-    } finally {
-      setImportingScript(false);
-    }
-  }
-
-  async function importScriptURL() {
-    const url = scriptURL.trim();
-    if (!url) {
-      show("请填写脚本链接", "error");
-      return;
-    }
-    setImportingScript(true);
-    try {
-      const resp = await api.importCrawlerScriptURL(url);
-      set("scriptPath", resp.scriptPath);
-      set("name", resp.name);
-      setScriptURL("");
-      setTestResult(null);
-      show("脚本已导入", "success");
-    } catch (e) {
-      show(e instanceof Error ? e.message : "导入失败", "error");
-    } finally {
-      setImportingScript(false);
-    }
-  }
-
-  async function testScript() {
-    const scriptPath = form.scriptPath.trim();
-    if (!scriptPath) {
-      show("请先导入爬虫脚本", "error");
-      return;
-    }
-    setTestingScript(true);
-    setTestResult(null);
-    try {
-      const result = await api.testCrawlerScript({
-        scriptPath,
-        proxy: form.proxy.trim(),
-      });
-      setTestResult(result);
-      if (result.ok) {
-        show("测试通过", "success");
-      } else {
-        show(crawlerTestFailure(result) || "测试失败", "error");
-      }
-    } catch (e) {
-      show(e instanceof Error ? e.message : "测试失败", "error");
-    } finally {
-      setTestingScript(false);
-    }
-  }
+  const stats = useMemo(
+    () => ({
+      total: list.length,
+      ready: list.filter((item) => item.status === "ok").length,
+      busy: list.filter(crawlerBusy).length,
+      error: list.filter((item) => item.status === "error").length,
+    }),
+    [list]
+  );
 
   async function run(crawler: api.AdminCrawler) {
     setRunningId(crawler.id);
@@ -217,7 +113,7 @@ export function CrawlersPage() {
         return;
       }
       show("已触发抓取任务", "success");
-      await refresh();
+      await refresh(true);
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
     } finally {
@@ -230,7 +126,7 @@ export function CrawlersPage() {
     try {
       const resp = await api.stopCrawlerTasks(crawler.id);
       show(resp.stopped ? "已请求停止任务" : "当前没有可停止任务", "info");
-      await refresh();
+      await refresh(true);
     } catch (e) {
       show(e instanceof Error ? e.message : "停止失败", "error");
     } finally {
@@ -238,23 +134,23 @@ export function CrawlersPage() {
     }
   }
 
-  async function remove(crawler: api.AdminCrawler) {
-    if (!window.confirm(`删除爬虫 ${crawler.name} 的脚本和配置？已爬取的视频会保留。`)) return;
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    setDeleting(true);
     try {
-      const resp = await api.deleteCrawler(crawler.id);
+      const resp = await api.deleteCrawler(deleteTarget.id);
       if (resp.warning) {
         show(`已删除爬虫配置，但脚本文件清理失败：${resp.warning}`, "error");
-      } else if (resp.deletedScript) {
-        show("已删除爬虫配置和脚本文件，已爬取视频保留", "success");
       } else {
-        show("已删除爬虫配置，已爬取视频保留", "success");
+        show("已删除爬虫，已爬取的视频保留", "success");
       }
-      setSelectedId("");
-      setForm(emptyForm);
-      setMode("list");
-      await refresh();
+      setDeleteTarget(null);
+      if (expandedId === deleteTarget.id) setExpandedId("");
+      await refresh(true);
     } catch (e) {
       show(e instanceof Error ? e.message : "删除失败", "error");
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -263,206 +159,94 @@ export function CrawlersPage() {
       <header className="admin-page__header">
         <div>
           <h1 className="admin-page__title">爬虫管理</h1>
+          <p className="admin-page__subtitle">导入符合协议的 Python 脚本，自动抓取视频并生成封面、预览和指纹</p>
         </div>
         <div className="admin-detail-actions-inline">
-          {mode === "list" ? (
-            <button className="admin-btn is-primary" onClick={createCustom}>
-              <Plus size={14} /> 添加爬虫
-            </button>
-          ) : (
-            <button className="admin-btn" onClick={backToList}>
-              <ArrowLeft size={14} /> 返回列表
-            </button>
-          )}
+          <button className="admin-btn" onClick={() => refresh()} disabled={loading}>
+            <RefreshCw size={14} className={loading ? "admin-spin" : undefined} /> 刷新
+          </button>
+          <button className="admin-btn is-primary" onClick={() => setEditorTarget(null)}>
+            <Plus size={14} /> 添加爬虫
+          </button>
         </div>
       </header>
 
-      {mode === "list" ? (
-        <div className="admin-crawler-console">
-          <div className="admin-crawler-overview">
-            <CrawlerMetric label="已配置" value={stats.total} icon={<SpiderIcon size={16} />} />
-            <CrawlerMetric label="已就绪" value={stats.ready} icon={<Activity size={16} />} tone="ok" />
-            <CrawlerMetric label="抓取中" value={stats.running} icon={<RefreshCw size={16} />} tone="info" />
-            <CrawlerMetric label="错误" value={stats.error} icon={<CircleStop size={16} />} tone="error" />
-          </div>
+      <div className="admin-crawler-console">
+        <div className="admin-crawler-overview">
+          <CrawlerMetric label="已配置" value={stats.total} icon={<SpiderIcon size={16} />} />
+          <CrawlerMetric label="已就绪" value={stats.ready} icon={<Activity size={16} />} tone="ok" />
+          <CrawlerMetric label="任务进行中" value={stats.busy} icon={<RefreshCw size={16} />} tone="info" />
+          <CrawlerMetric label="异常" value={stats.error} icon={<AlertTriangle size={16} />} tone="error" />
+        </div>
 
-          <div className="admin-card admin-crawler-list">
-            <div className="admin-crawler-list__head">
-              <header className="admin-card__title">
-                <SpiderIcon size={16} /> 已配置爬虫
-              </header>
-              <button className="admin-btn" type="button" onClick={refresh} disabled={loading}>
-                <RefreshCw size={13} className={loading ? "admin-spin" : undefined} /> 刷新
+        <div className="admin-card admin-crawler-list">
+          <div className="admin-crawler-list__head">
+            <header className="admin-card__title">
+              <SpiderIcon size={16} /> 已配置爬虫
+            </header>
+            {anyBusy && (
+              <span className="admin-crawler-list__live">
+                <RefreshCw size={12} className="admin-spin" /> 任务进行中，自动刷新
+              </span>
+            )}
+          </div>
+          {loading ? (
+            <div className="admin-loading-state">
+              <RefreshCw size={18} className="admin-spin" />
+              <span>加载中...</span>
+            </div>
+          ) : list.length === 0 ? (
+            <div className="admin-crawler-empty">
+              <SpiderIcon size={28} />
+              <strong>暂无爬虫</strong>
+              <p>导入脚本 → 测试运行 → 保存启用，三步接入一个新片源</p>
+              <button className="admin-btn is-primary" type="button" onClick={() => setEditorTarget(null)}>
+                <Plus size={13} /> 添加爬虫
               </button>
             </div>
-            {loading ? (
-              <div className="admin-loading-state">
-                <RefreshCw size={18} className="admin-spin" />
-                <span>加载中...</span>
-              </div>
-            ) : list.length === 0 ? (
-              <div className="admin-crawler-empty">
-                <SpiderIcon size={28} />
-                <strong>暂无爬虫</strong>
-                <button className="admin-btn is-primary" type="button" onClick={createCustom}>
-                  <Plus size={13} /> 添加爬虫
-                </button>
-              </div>
-            ) : (
-              <div className="admin-crawler-table">
-                {list.map((crawler) => (
-                  <CrawlerRow
-                    key={crawler.id}
-                    crawler={crawler}
-                    active={crawler.id === selectedId}
-                    running={runningId === crawler.id}
-                    stopping={stoppingId === crawler.id}
-                    onSelect={() => selectCrawler(crawler)}
-                    onRun={() => run(crawler)}
-                    onStop={() => stop(crawler)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          ) : (
+            <div className="admin-crawler-table">
+              {list.map((crawler) => (
+                <CrawlerRow
+                  key={crawler.id}
+                  crawler={crawler}
+                  expanded={expandedId === crawler.id}
+                  running={runningId === crawler.id}
+                  stopping={stoppingId === crawler.id}
+                  onToggle={() => setExpandedId(expandedId === crawler.id ? "" : crawler.id)}
+                  onRun={() => run(crawler)}
+                  onStop={() => stop(crawler)}
+                  onEdit={() => setEditorTarget(crawler)}
+                  onDelete={() => setDeleteTarget(crawler)}
+                />
+              ))}
+            </div>
+          )}
         </div>
-      ) : (
-        <div className="admin-crawler-editor">
-          <div className="admin-crawler-editor__main">
-            <div className="admin-crawler-section">
-              <div className="admin-crawler-section__head">
-                <span className="admin-crawler-section__icon"><Settings2 size={15} /></span>
-                <span className="admin-crawler-section__title">基础信息</span>
-              </div>
-              <div className="admin-crawler-script-name">
-                <span>脚本名称</span>
-                <strong>{form.name || "导入脚本后自动读取"}</strong>
-              </div>
-            </div>
+      </div>
 
-            <div className="admin-crawler-section">
-              <div className="admin-crawler-section__head">
-                <span className="admin-crawler-section__icon"><FileCode2 size={15} /></span>
-                <span className="admin-crawler-section__title">脚本导入与测试</span>
-              </div>
-              <div className="admin-form">
-                <div className="admin-form__row">
-                  <label htmlFor="crawler-script-url">导入脚本</label>
-                  <div className="admin-crawler-import">
-                    <input
-                      id="crawler-script-file"
-                      className="admin-crawler-import__file"
-                      type="file"
-                      accept=".py,text/x-python"
-                      disabled={importingScript}
-                      onChange={(e) => {
-                        importScriptFile(e.target.files?.[0]);
-                        e.currentTarget.value = "";
-                      }}
-                    />
-                    <label className="admin-btn" htmlFor="crawler-script-file" aria-disabled={importingScript}>
-                      <Upload size={13} /> 上传文件
-                    </label>
-                    <input
-                      id="crawler-script-url"
-                      value={scriptURL}
-                      onChange={(e) => setScriptURL(e.target.value)}
-                      placeholder="https://example.com/crawler.py"
-                      disabled={importingScript}
-                    />
-                    <button className="admin-btn" type="button" onClick={importScriptURL} disabled={importingScript}>
-                      <LinkIcon size={13} /> {importingScript ? "导入中..." : "链接导入"}
-                    </button>
-                    <button
-                      className="admin-btn"
-                      type="button"
-                      onClick={testScript}
-                      disabled={!form.scriptPath || importingScript || testingScript}
-                    >
-                      <TestTube size={13} /> {testingScript ? "测试中..." : "测试脚本"}
-                    </button>
-                  </div>
-                  {form.scriptPath && <div className="admin-form__help">脚本已导入</div>}
-                  {testResult && <CrawlerTestResult result={testResult} />}
-                </div>
-              </div>
-            </div>
+      <CrawlerEditorModal
+        open={editorTarget !== undefined}
+        crawler={editorTarget ?? null}
+        uploadTargets={uploadTargets}
+        onClose={() => setEditorTarget(undefined)}
+        onSaved={() => {
+          setEditorTarget(undefined);
+          refresh(true);
+        }}
+      />
 
-            <div className="admin-crawler-section">
-              <div className="admin-crawler-section__head">
-                <span className="admin-crawler-section__icon"><Gauge size={15} /></span>
-                <span className="admin-crawler-section__title">运行参数</span>
-              </div>
-              <div className="admin-crawler-params">
-                <div className="admin-form__row">
-                  <label htmlFor="crawler-target">每次补充新视频数</label>
-                  <input id="crawler-target" value={form.targetNew} onChange={(e) => set("targetNew", e.target.value)} placeholder="10" />
-                </div>
-                <div className="admin-form__row">
-                  <label htmlFor="crawler-proxy">代理地址</label>
-                  <input
-                    id="crawler-proxy"
-                    value={form.proxy}
-                    onChange={(e) => {
-                      set("proxy", e.target.value);
-                      setTestResult(null);
-                    }}
-                    placeholder="http://127.0.0.1:7890"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <aside className="admin-crawler-editor__side">
-            <div className="admin-crawler-action-panel">
-              <div className="admin-crawler-action-panel__head">
-                <span className="admin-crawler-action-panel__mark">
-                  <SpiderIcon size={18} />
-                </span>
-                <div>
-                  <strong>{selected ? "爬虫配置" : "添加爬虫"}</strong>
-                  <span>{selected ? crawlerStatusLabel(selected) : "未保存"}</span>
-                </div>
-              </div>
-              <div className="admin-crawler-action-panel__buttons">
-                <button className="admin-btn is-primary" onClick={save} disabled={saving}>
-                  <Save size={13} /> {saving ? "保存中..." : "保存"}
-                </button>
-                {selected && (
-                  <>
-                    <button className="admin-btn" onClick={() => run(selected)} disabled={runningId === selected.id}>
-                      <Download size={13} /> {runningId === selected.id ? "触发中..." : "立即抓取"}
-                    </button>
-                    <button className="admin-btn is-stop" onClick={() => stop(selected)} disabled={stoppingId === selected.id}>
-                      <CircleStop size={13} /> {stoppingId === selected.id ? "停止中..." : "停止任务"}
-                    </button>
-                    <button className="admin-btn is-danger" onClick={() => remove(selected)}>
-                      <Trash2 size={13} /> 删除
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {selected && (
-              <div className="admin-crawler-side-panel">
-                <div className="admin-crawler-section__head">
-                  <span className="admin-crawler-section__icon"><Activity size={15} /></span>
-                  <span className="admin-crawler-section__title">任务状态</span>
-                </div>
-                <div className="admin-crawler-status-grid">
-                  <CrawlerStatus label="抓取" status={selected.scanGenerationStatus} />
-                  <CrawlerStatus label="封面" status={selected.thumbnailGenerationStatus} />
-                  <CrawlerStatus label="预览视频" status={selected.previewGenerationStatus} />
-                  <CrawlerStatus label="视频指纹" status={selected.fingerprintGenerationStatus} />
-                </div>
-                {selected.lastError && <div className="admin-detail-error">{selected.lastError}</div>}
-              </div>
-            )}
-          </aside>
-        </div>
-      )}
+      <ConfirmModal
+        open={deleteTarget !== null}
+        title="删除爬虫"
+        message={`确定删除爬虫「${deleteTarget?.name ?? ""}」？`}
+        details={["爬虫配置和脚本文件会被删除", "已爬取的视频、封面和预览会保留"]}
+        confirmText="删除"
+        danger
+        loading={deleting}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={confirmDelete}
+      />
     </section>
   );
 }
@@ -477,90 +261,491 @@ function CrawlerMetric({ label, value, icon, tone }: { label: string; value: num
   );
 }
 
+type StageInfo = {
+  key: string;
+  label: string;
+  status?: api.DriveGenerationStatus;
+};
+
+function crawlerStages(crawler: api.AdminCrawler): StageInfo[] {
+  return [
+    { key: "scan", label: "抓取", status: crawler.scanGenerationStatus },
+    { key: "thumbnail", label: "封面", status: crawler.thumbnailGenerationStatus },
+    { key: "preview", label: "预览", status: crawler.previewGenerationStatus },
+    { key: "fingerprint", label: "指纹", status: crawler.fingerprintGenerationStatus },
+  ];
+}
+
+function stageStateLabel(stage: StageInfo): string {
+  const state = stage.status?.state || "idle";
+  if (stage.key === "scan" && state === "scanning") return "抓取中";
+  return generationStateLabel(state);
+}
+
 function CrawlerRow({
   crawler,
-  active,
+  expanded,
   running,
   stopping,
-  onSelect,
+  onToggle,
   onRun,
   onStop,
+  onEdit,
+  onDelete,
 }: {
   crawler: api.AdminCrawler;
-  active: boolean;
+  expanded: boolean;
   running: boolean;
   stopping: boolean;
-  onSelect: () => void;
+  onToggle: () => void;
   onRun: () => void;
   onStop: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
 }) {
+  const busy = crawlerBusy(crawler);
   return (
-    <div className={`admin-crawler-row ${active ? "is-active" : ""}`}>
-      <button type="button" className="admin-crawler-row__main" onClick={onSelect}>
-        <span className="admin-crawler-row__brand">
-          <SpiderIcon size={16} />
-        </span>
-        <span className="admin-crawler-row__title-wrap">
-          <strong>{crawler.name}</strong>
-          <span>{crawler.scriptPath ? "脚本已导入" : "未导入脚本"}</span>
-        </span>
-        <span className={`admin-status is-${crawler.status === "ok" ? "ok" : crawler.status === "error" ? "error" : "pending"}`}>
-          {crawlerStatusLabel(crawler)}
-        </span>
-        <ChevronRight size={16} className="admin-crawler-row__chevron" />
-      </button>
-      <div className="admin-crawler-row__states">
-        <CrawlerStateChip label="抓取" status={crawler.scanGenerationStatus} />
-        <CrawlerStateChip label="封面" status={crawler.thumbnailGenerationStatus} />
-        <CrawlerStateChip label="预览" status={crawler.previewGenerationStatus} />
-        <CrawlerStateChip label="指纹" status={crawler.fingerprintGenerationStatus} />
-      </div>
-      <div className="admin-crawler-row__meta">
-        <span><Gauge size={12} /> {crawler.targetNew || "10"} 条</span>
-        <span><Clock size={12} /> {formatLastCrawl(crawler.lastCrawlAt)}</span>
-      </div>
-      <div className="admin-crawler-row__actions">
-        <button className="admin-btn" type="button" onClick={onSelect}>
-          <Settings2 size={13} /> 管理
+    <div className={`admin-crawler-row ${expanded ? "is-expanded" : ""}`}>
+      <div className="admin-crawler-row__line">
+        <button type="button" className="admin-crawler-row__main" onClick={onToggle} aria-expanded={expanded}>
+          <span className="admin-crawler-row__brand">
+            <SpiderIcon size={16} />
+          </span>
+          <span className="admin-crawler-row__title-wrap">
+            <strong>{crawler.name}</strong>
+            <span>
+              上次抓取 {formatLastCrawl(crawler.lastCrawlAt)} · 每次新增 {crawler.targetNew || "10"} 条 · 累计爬取 {crawler.totalCrawledCount ?? 0} 条
+            </span>
+          </span>
+          <span className="admin-crawler-pipeline">
+            {crawlerStages(crawler).map((stage) => {
+              const state = stage.status?.state || "idle";
+              const active = BUSY_STATES.has(state) || state === "cooling";
+              return (
+                <span
+                  key={stage.key}
+                  className={`admin-crawler-stage is-${generationStateClass(state)}`}
+                  title={`${stage.label}：${stageStateLabel(stage)}`}
+                >
+                  <span className="admin-crawler-stage__dot" />
+                  {stage.label}
+                  {active && <em>{stageStateLabel(stage)}</em>}
+                </span>
+              );
+            })}
+          </span>
+          <span className={`admin-status is-${crawler.status === "ok" ? "ok" : crawler.status === "error" ? "error" : "pending"}`}>
+            {crawlerStatusLabel(crawler)}
+          </span>
+          <ChevronDown size={16} className="admin-crawler-row__chevron" />
         </button>
-        <button className="admin-btn" type="button" onClick={onRun} disabled={running}>
-          <Download size={13} /> {running ? "触发中..." : "立即抓取"}
-        </button>
-        <button className="admin-btn is-stop" type="button" onClick={onStop} disabled={stopping}>
-          <CircleStop size={13} /> {stopping ? "停止中..." : "停止"}
-        </button>
+        <div className="admin-crawler-row__actions">
+          {busy ? (
+            <button className="admin-btn is-stop" type="button" onClick={onStop} disabled={stopping}>
+              <CircleStop size={13} /> {stopping ? "停止中..." : "停止"}
+            </button>
+          ) : (
+            <button className="admin-btn" type="button" onClick={onRun} disabled={running}>
+              <Download size={13} /> {running ? "触发中..." : "立即抓取"}
+            </button>
+          )}
+          <button className="admin-btn" type="button" onClick={onEdit}>
+            <Pencil size={13} /> 编辑
+          </button>
+          <button className="admin-btn is-danger admin-crawler-row__delete" type="button" onClick={onDelete} aria-label="删除爬虫" title="删除爬虫">
+            <Trash2 size={13} />
+          </button>
+        </div>
       </div>
+      {expanded && <CrawlerDetail crawler={crawler} />}
     </div>
   );
 }
 
-function CrawlerStateChip({ label, status }: { label: string; status?: api.DriveGenerationStatus }) {
-  const state = status?.state || "idle";
+function CrawlerDetail({ crawler }: { crawler: api.AdminCrawler }) {
+  const scan = crawler.scanGenerationStatus;
   return (
-    <span className={`admin-crawler-state-chip is-${generationStateClass(state)}`}>
-      {label} · {label === "抓取" && state === "scanning" ? "抓取中" : generationStateLabel(state)}
-    </span>
+    <div className="admin-crawler-detail">
+      <div className="admin-crawler-detail__grid">
+        <GenStageCard
+          label="抓取"
+          status={scan}
+          stateText={scan?.state === "scanning" ? "抓取中" : generationStateLabel(scan?.state || "idle")}
+          counts={[
+            { label: "累计爬取", value: crawler.totalCrawledCount ?? 0 },
+            { label: "本地保留", value: crawler.localVideoCount ?? 0 },
+            { label: "已上传", value: crawler.migratedVideoCount ?? 0 },
+            { label: "本轮检查", value: scan?.scannedCount ?? 0 },
+            { label: "本轮新增", value: scan?.addedCount ?? 0 },
+          ]}
+        />
+        <GenStageCard
+          label="封面"
+          status={crawler.thumbnailGenerationStatus}
+          counts={[
+            { label: "已生成", value: crawler.thumbnailReadyCount },
+            { label: "待生成", value: crawler.thumbnailPendingCount },
+            { label: "失败", value: crawler.thumbnailFailedCount, tone: "danger" },
+          ]}
+        />
+        <GenStageCard
+          label="预览视频"
+          status={crawler.previewGenerationStatus}
+          counts={[
+            { label: "已生成", value: crawler.teaserReadyCount },
+            { label: "待生成", value: crawler.teaserPendingCount },
+            { label: "失败", value: crawler.teaserFailedCount, tone: "danger" },
+          ]}
+        />
+        <GenStageCard
+          label="视频指纹"
+          status={crawler.fingerprintGenerationStatus}
+          counts={[
+            { label: "已生成", value: crawler.fingerprintReadyCount },
+            { label: "待生成", value: crawler.fingerprintPendingCount },
+            { label: "失败", value: crawler.fingerprintFailedCount, tone: "danger" },
+          ]}
+        />
+      </div>
+      {crawler.lastError && (
+        <div className="admin-crawler-detail__error">
+          <AlertTriangle size={14} />
+          <span>{crawler.lastError}</span>
+        </div>
+      )}
+    </div>
   );
 }
 
-function CrawlerStatus({ label, status }: { label: string; status?: api.DriveGenerationStatus }) {
+function GenStageCard({
+  label,
+  status,
+  stateText,
+  counts,
+}: {
+  label: string;
+  status?: api.DriveGenerationStatus;
+  stateText?: string;
+  counts: Array<{ label: string; value: number; tone?: "danger" }>;
+}) {
   const state = status?.state || "idle";
-  const labelText = label === "抓取" && state === "scanning" ? "抓取中" : generationStateLabel(state);
   return (
     <div className="admin-gen-col">
       <div className="admin-gen-col__head">
         <span className="admin-gen-col__label">{label}</span>
         <span className={`admin-status admin-generation-state is-${generationStateClass(state)}`}>
-          {labelText}
+          {stateText ?? generationStateLabel(state)}
         </span>
       </div>
-      {label === "抓取" && (
-        <div className="admin-gen-col__counts admin-gen-col__counts--scan">
-          <div className="admin-gen-col__count"><span>已抓取</span><strong>{status?.scannedCount ?? 0}</strong></div>
-          <div className="admin-gen-col__count"><span>预计新增</span><strong>{status?.addedCount ?? 0}</strong></div>
-        </div>
-      )}
+      {status?.currentTitle && <div className="admin-gen-col__detail">{status.currentTitle}</div>}
+      <div className="admin-gen-col__counts">
+        {counts.map((count) => (
+          <div className="admin-gen-col__count" key={count.label}>
+            <span>{count.label}</span>
+            <strong className={count.tone === "danger" && count.value > 0 ? "is-danger" : undefined}>{count.value}</strong>
+          </div>
+        ))}
+      </div>
     </div>
+  );
+}
+
+// ---------- 编辑器 ----------
+
+type EditorForm = {
+  scriptPath: string;
+  name: string;
+  targetNew: string;
+  proxy: string;
+  uploadDriveId: string;
+};
+
+function CrawlerEditorModal({
+  open,
+  crawler,
+  uploadTargets,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  crawler: api.AdminCrawler | null;
+  uploadTargets: api.AdminDrive[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const isEdit = crawler !== null;
+  const [form, setForm] = useState<EditorForm>({ scriptPath: "", name: "", targetNew: "10", proxy: "", uploadDriveId: "" });
+  const [scriptURL, setScriptURL] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<api.CrawlerDryRunResult | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { show } = useToast();
+
+  useEffect(() => {
+    if (!open) return;
+    setForm({
+      scriptPath: crawler?.scriptPath ?? "",
+      name: crawler?.name ?? "",
+      targetNew: crawler?.targetNew || "10",
+      proxy: crawler?.proxy ?? "",
+      uploadDriveId: crawler?.uploadDriveId ?? "",
+    });
+    setScriptURL("");
+    setTestResult(null);
+    setDragOver(false);
+  }, [open, crawler]);
+
+  function set<K extends keyof EditorForm>(key: K, value: EditorForm[K]) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  async function importFile(file: File | null | undefined) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".py")) {
+      show("仅支持 .py 脚本文件", "error");
+      return;
+    }
+    setImporting(true);
+    try {
+      const resp = await api.importCrawlerScriptFile(file);
+      set("scriptPath", resp.scriptPath);
+      set("name", resp.name);
+      setTestResult(null);
+      show("脚本已导入", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "导入失败", "error");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function importURL() {
+    const url = scriptURL.trim();
+    if (!url) {
+      show("请填写脚本链接", "error");
+      return;
+    }
+    setImporting(true);
+    try {
+      const resp = await api.importCrawlerScriptURL(url);
+      set("scriptPath", resp.scriptPath);
+      set("name", resp.name);
+      setScriptURL("");
+      setTestResult(null);
+      show("脚本已导入", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "导入失败", "error");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function test() {
+    const scriptPath = form.scriptPath.trim();
+    if (!scriptPath) {
+      show("请先导入爬虫脚本", "error");
+      return;
+    }
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await api.testCrawlerScript({ scriptPath, proxy: form.proxy.trim() });
+      setTestResult(result);
+      if (result.ok) {
+        show("测试通过", "success");
+      } else {
+        show(crawlerTestFailure(result) || "测试失败", "error");
+      }
+    } catch (e) {
+      show(e instanceof Error ? e.message : "测试失败", "error");
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function save() {
+    if (!form.scriptPath.trim()) {
+      show("请先导入爬虫脚本", "error");
+      return;
+    }
+    const target = form.targetNew.trim();
+    if (target && (!/^\d+$/.test(target) || Number(target) < 1)) {
+      show("每次新增视频数需为正整数", "error");
+      return;
+    }
+    setSaving(true);
+    try {
+      const resp = await api.upsertCrawler({
+        id: crawler?.id,
+        scriptPath: form.scriptPath.trim(),
+        targetNew: target,
+        proxy: form.proxy.trim(),
+        uploadDriveId: form.uploadDriveId,
+      });
+      if (resp.warning) {
+        show(`已保存，但初始化失败：${resp.warning}`, "error");
+      } else {
+        show("已保存", "success");
+      }
+      onSaved();
+    } catch (e) {
+      show(e instanceof Error ? e.message : "保存失败", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function onDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDragOver(false);
+    if (importing) return;
+    importFile(e.dataTransfer.files?.[0]);
+  }
+
+  return (
+    <Modal
+      open={open}
+      title={isEdit ? `编辑爬虫 · ${crawler?.name ?? ""}` : "添加爬虫"}
+      onClose={onClose}
+      className="admin-modal--crawler"
+      footer={
+        <>
+          <button type="button" className="admin-btn" onClick={onClose} disabled={saving}>
+            取消
+          </button>
+          <button type="button" className="admin-btn is-primary" onClick={save} disabled={saving || !form.scriptPath}>
+            {saving ? "保存中..." : "保存"}
+          </button>
+        </>
+      }
+    >
+      <div className="admin-crawler-steps">
+        <section className="admin-crawler-step">
+          <header className="admin-crawler-step__head">
+            <span className="admin-crawler-step__num">1</span>
+            <div>
+              <strong>导入脚本</strong>
+              <span>上传 .py 文件或粘贴脚本链接，脚本需实现统一抓取协议</span>
+            </div>
+          </header>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".py,text/x-python"
+            hidden
+            onChange={(e) => {
+              importFile(e.target.files?.[0]);
+              e.currentTarget.value = "";
+            }}
+          />
+          <div
+            className={`admin-crawler-dropzone${dragOver ? " is-dragover" : ""}${importing ? " is-busy" : ""}`}
+            role="button"
+            tabIndex={0}
+            onClick={() => !importing && fileInputRef.current?.click()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                if (!importing) fileInputRef.current?.click();
+              }
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}
+          >
+            <Upload size={20} />
+            <strong>{importing ? "导入中..." : "点击或拖拽 .py 脚本到此处上传"}</strong>
+          </div>
+          <div className="admin-crawler-urlrow">
+            <input
+              value={scriptURL}
+              onChange={(e) => setScriptURL(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  importURL();
+                }
+              }}
+              placeholder="https://example.com/crawler.py"
+              disabled={importing}
+              aria-label="脚本链接"
+            />
+            <button className="admin-btn" type="button" onClick={importURL} disabled={importing}>
+              <LinkIcon size={13} /> 链接导入
+            </button>
+          </div>
+          {form.scriptPath && (
+            <div className="admin-crawler-script-chip">
+              <FileCode2 size={14} />
+              <strong>{form.name || "未命名脚本"}</strong>
+              <span>{form.scriptPath}</span>
+            </div>
+          )}
+        </section>
+
+        <section className="admin-crawler-step">
+          <header className="admin-crawler-step__head">
+            <span className="admin-crawler-step__num">2</span>
+            <div>
+              <strong>测试脚本</strong>
+              <span>模拟抓取一条视频，校验协议字段和直链可用性（推荐）</span>
+            </div>
+          </header>
+          <div>
+            <button className="admin-btn" type="button" onClick={test} disabled={!form.scriptPath || importing || testing}>
+              <TestTube size={13} /> {testing ? "测试中..." : "运行测试"}
+            </button>
+          </div>
+          {testResult && <CrawlerTestResult result={testResult} />}
+        </section>
+
+        <section className="admin-crawler-step">
+          <header className="admin-crawler-step__head">
+            <span className="admin-crawler-step__num">3</span>
+            <div>
+              <strong>运行参数</strong>
+              <span>留空使用默认值</span>
+            </div>
+          </header>
+          <div className="admin-crawler-params">
+            <div className="admin-form__row">
+              <label htmlFor="crawler-target">每次新增视频数</label>
+              <input
+                id="crawler-target"
+                type="number"
+                min={1}
+                value={form.targetNew}
+                onChange={(e) => set("targetNew", e.target.value)}
+                placeholder="10"
+              />
+            </div>
+            <div className="admin-form__row">
+              <label htmlFor="crawler-proxy">代理地址</label>
+              <input
+                id="crawler-proxy"
+                value={form.proxy}
+                onChange={(e) => {
+                  set("proxy", e.target.value);
+                  setTestResult(null);
+                }}
+                placeholder="http://127.0.0.1:7890"
+              />
+            </div>
+            <Spider91UploadTargetField
+              value={form.uploadDriveId}
+              onChange={(value) => set("uploadDriveId", value)}
+              uploadTargets={uploadTargets}
+            />
+          </div>
+        </section>
+      </div>
+    </Modal>
   );
 }
 
@@ -568,12 +753,11 @@ function CrawlerTestResult({ result }: { result: api.CrawlerDryRunResult }) {
   const item = result.items[0];
   const failure = crawlerTestFailure(result);
   const media = result.mediaCheck;
-  const statusText = result.ok ? "测试通过" : "测试失败";
 
   return (
     <div className={`admin-crawler-test-result ${result.ok ? "is-ok" : "is-error"}`}>
       <div className="admin-crawler-test-result__head">
-        <span className={`admin-status is-${result.ok ? "ok" : "error"}`}>{statusText}</span>
+        <span className={`admin-status is-${result.ok ? "ok" : "error"}`}>{result.ok ? "测试通过" : "测试失败"}</span>
         <span>抓取到 {result.items.length} 条视频</span>
         {result.durationMs > 0 && <span>{Math.round(result.durationMs / 1000)} 秒</span>}
       </div>
@@ -633,7 +817,7 @@ function crawlerStatusLabel(crawler: api.AdminCrawler) {
 }
 
 function formatLastCrawl(ts?: number) {
-  if (!ts) return "未抓取";
+  if (!ts) return "从未";
   return new Date(ts * 1000).toLocaleString("zh-CN", {
     month: "2-digit",
     day: "2-digit",

@@ -164,7 +164,11 @@ func main() {
 			if err != nil {
 				return err
 			}
-			return app.attachDrive(ctx, d)
+			if err := app.attachDrive(ctx, d); err != nil {
+				return err
+			}
+			app.scheduleCrawlerUploadMigration(ctx, driveID)
+			return nil
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
 			return app.cleanupDriveVideosForDelete(cleanupCtx, driveID)
@@ -355,6 +359,10 @@ type App struct {
 	// reconcile 和扫盘结束同时为同一批 pending 视频启动多个长时间入队 goroutine。
 	fingerprintQueueMu  sync.Mutex
 	fingerprintQueueing map[string]bool
+
+	// crawlerUploadRunning 去重"保存上传目标后检查本地未上传文件"的后台任务。
+	crawlerUploadMu      sync.Mutex
+	crawlerUploadRunning map[string]bool
 }
 
 type driveScanProgress struct {
@@ -2419,21 +2427,25 @@ func (a *App) listSpider91DriveIDs(ctx context.Context) []string {
 	return out
 }
 
-// waitAllPreviewQueuesIdle 阻塞直到所有 drive 的封面 worker 和预览视频 worker
+// waitAllPreviewQueuesIdle 阻塞直到所有 drive 的封面、预览视频和指纹 worker
 // 队列都为空且无 in-flight 任务。
 //
-// 顺序：先等所有 thumb worker，再等所有预览视频。两个队列生成时互不等待；
-// nightly 只在 phase 边界统一等待它们都 drain。
+// 顺序：先等所有 thumb worker，再等预览视频，最后等指纹。队列生成时互不等待；
+// nightly 只在 phase 边界统一等待它们都 drain，保证爬虫视频迁移前本地资产已产出。
 // 若 ctx 在等待中被取消（软超时 / shutdown），立即返回 ctx.Err。
 func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
 	a.mu.Lock()
 	thumbWorkers := make([]*preview.ThumbWorker, 0, len(a.thumbWorkers))
 	previewWorkers := make([]*preview.Worker, 0, len(a.workers))
+	fingerprintWorkers := make([]*fingerprint.Worker, 0, len(a.fingerprintWorkers))
 	for _, w := range a.thumbWorkers {
 		thumbWorkers = append(thumbWorkers, w)
 	}
 	for _, w := range a.workers {
 		previewWorkers = append(previewWorkers, w)
+	}
+	for _, w := range a.fingerprintWorkers {
+		fingerprintWorkers = append(fingerprintWorkers, w)
 	}
 	a.mu.Unlock()
 
@@ -2447,7 +2459,63 @@ func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := a.waitFingerprintQueueingIdle(ctx, ""); err != nil {
+		return err
+	}
+	for _, w := range fingerprintWorkers {
+		if err := w.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (a *App) waitDriveGenerationQueuesIdle(ctx context.Context, driveID string) error {
+	a.mu.Lock()
+	thumbWorker := a.thumbWorkers[driveID]
+	previewWorker := a.workers[driveID]
+	fingerprintWorker := a.fingerprintWorkers[driveID]
+	a.mu.Unlock()
+	if err := thumbWorker.WaitIdle(ctx); err != nil {
+		return err
+	}
+	if err := previewWorker.WaitIdle(ctx); err != nil {
+		return err
+	}
+	if err := a.waitFingerprintQueueingIdle(ctx, driveID); err != nil {
+		return err
+	}
+	if err := fingerprintWorker.WaitIdle(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *App) waitFingerprintQueueingIdle(ctx context.Context, driveID string) error {
+	if !a.fingerprintQueueingBusy(driveID) {
+		return nil
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if !a.fingerprintQueueingBusy(driveID) {
+				return nil
+			}
+		}
+	}
+}
+
+func (a *App) fingerprintQueueingBusy(driveID string) bool {
+	a.fingerprintQueueMu.Lock()
+	defer a.fingerprintQueueMu.Unlock()
+	if driveID != "" {
+		return a.fingerprintQueueing[driveID]
+	}
+	return len(a.fingerprintQueueing) > 0
 }
 
 func shouldScanDrive(d drives.Drive) bool {
@@ -2502,7 +2570,9 @@ func (a *App) scheduleScriptCrawlerCrawl(ctx context.Context, driveID string) bo
 			a.endDriveScanOrCrawl(driveID)
 			done()
 		}()
-		a.runScriptCrawlerCrawlWithTaskContext(taskCtx, driveID)
+		if a.runScriptCrawlerCrawlWithTaskContext(taskCtx, driveID) {
+			a.runCrawlerMigrationAfterManualCrawl(taskCtx, driveID)
+		}
 	}()
 	return true
 }
@@ -2606,30 +2676,136 @@ func (a *App) runScriptCrawlerCrawlWithTaskContext(ctx context.Context, driveID 
 }
 
 func (a *App) runSpider91MigrationAfterManualCrawl(ctx context.Context, driveID string) {
+	a.runCrawlerMigrationAfterManualCrawl(ctx, driveID)
+}
+
+func (a *App) scheduleCrawlerUploadMigration(ctx context.Context, driveID string) bool {
+	driveID = strings.TrimSpace(driveID)
+	if driveID == "" || a == nil || a.cat == nil {
+		return false
+	}
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil || d == nil || d.Kind != scriptcrawler.Kind || strings.TrimSpace(d.Credentials["upload_drive_id"]) == "" {
+		return false
+	}
+	if a.spider91Migrator == nil {
+		log.Printf("[scriptcrawler] drive=%s skip saved upload migration: migrator not configured", driveID)
+		return false
+	}
+
+	a.crawlerUploadMu.Lock()
+	if a.crawlerUploadRunning == nil {
+		a.crawlerUploadRunning = make(map[string]bool)
+	}
+	if a.crawlerUploadRunning[driveID] {
+		a.crawlerUploadMu.Unlock()
+		log.Printf("[scriptcrawler] drive=%s saved upload migration already running", driveID)
+		return false
+	}
+	a.crawlerUploadRunning[driveID] = true
+	a.crawlerUploadMu.Unlock()
+
+	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
+	go func() {
+		defer func() {
+			done()
+			a.crawlerUploadMu.Lock()
+			delete(a.crawlerUploadRunning, driveID)
+			a.crawlerUploadMu.Unlock()
+		}()
+		a.runCrawlerUploadMigrationAfterSave(taskCtx, driveID)
+	}()
+	return true
+}
+
+func (a *App) runCrawlerUploadMigrationAfterSave(ctx context.Context, driveID string) {
 	if err := ctx.Err(); err != nil {
-		log.Printf("[spider91] drive=%s skip post-crawl migration: %v", driveID, err)
+		log.Printf("[scriptcrawler] drive=%s skip saved upload migration: %v", driveID, err)
 		return
 	}
-	targetDriveID := a.Spider91UploadDriveID()
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil || d == nil {
+		log.Printf("[scriptcrawler] drive=%s saved upload migration lookup: %v", driveID, err)
+		return
+	}
+	targetDriveID := strings.TrimSpace(d.Credentials["upload_drive_id"])
+	if d.Kind != scriptcrawler.Kind || targetDriveID == "" {
+		return
+	}
+	if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+		log.Printf("[scriptcrawler] drive=%s saved upload migration attach: %v", driveID, err)
+		return
+	}
+
+	a.mu.Lock()
+	worker := a.workers[driveID]
+	thumbWorker := a.thumbWorkers[driveID]
+	fingerprintWorker := a.fingerprintWorkers[driveID]
+	a.mu.Unlock()
+	a.scheduleFingerprintBackfill(ctx, driveID, fingerprintWorker)
+	a.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
+
+	log.Printf("[scriptcrawler] drive=%s checking local videos for upload target=%s", driveID, targetDriveID)
+	if err := a.waitDriveGenerationQueuesIdle(ctx, driveID); err != nil {
+		log.Printf("[scriptcrawler] drive=%s saved upload migration wait canceled: %v", driveID, err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		log.Printf("[scriptcrawler] drive=%s skip saved upload migration after wait: %v", driveID, err)
+		return
+	}
+	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+		log.Printf("[scriptcrawler] drive=%s saved upload migration: %v", driveID, err)
+	}
+}
+
+func (a *App) runCrawlerMigrationAfterManualCrawl(ctx context.Context, driveID string) {
+	if err := ctx.Err(); err != nil {
+		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration: %v", driveID, err)
+		return
+	}
+	if a.cat == nil {
+		targetDriveID := a.Spider91UploadDriveID()
+		if targetDriveID == "" || a.spider91Migrator == nil {
+			return
+		}
+		if err := a.waitDriveGenerationQueuesIdle(ctx, driveID); err != nil {
+			log.Printf("[scriptcrawler] drive=%s post-crawl migration wait canceled: %v", driveID, err)
+			return
+		}
+		if err := a.spider91Migrator.RunOnce(ctx); err != nil {
+			log.Printf("[scriptcrawler] drive=%s post-crawl migration: %v", driveID, err)
+		}
+		return
+	}
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil || d == nil {
+		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration lookup: %v", driveID, err)
+		return
+	}
+	targetDriveID := strings.TrimSpace(d.Credentials["upload_drive_id"])
+	if targetDriveID == "" && d.Kind == spider91.Kind {
+		targetDriveID = a.Spider91UploadDriveID()
+	}
 	if targetDriveID == "" {
 		return
 	}
 	if a.spider91Migrator == nil {
-		log.Printf("[spider91] drive=%s skip post-crawl migration: migrator not configured", driveID)
+		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration: migrator not configured", driveID)
 		return
 	}
-	log.Printf("[spider91] drive=%s waiting for generation queues before post-crawl migration target=%s", driveID, targetDriveID)
-	if err := a.waitAllPreviewQueuesIdle(ctx); err != nil {
-		log.Printf("[spider91] drive=%s post-crawl migration wait canceled: %v", driveID, err)
+	log.Printf("[scriptcrawler] drive=%s waiting for generation queues before post-crawl migration target=%s", driveID, targetDriveID)
+	if err := a.waitDriveGenerationQueuesIdle(ctx, driveID); err != nil {
+		log.Printf("[scriptcrawler] drive=%s post-crawl migration wait canceled: %v", driveID, err)
 		return
 	}
 	if err := ctx.Err(); err != nil {
-		log.Printf("[spider91] drive=%s skip post-crawl migration after wait: %v", driveID, err)
+		log.Printf("[scriptcrawler] drive=%s skip post-crawl migration after wait: %v", driveID, err)
 		return
 	}
-	log.Printf("[spider91] drive=%s running post-crawl migration target=%s", driveID, targetDriveID)
+	log.Printf("[scriptcrawler] drive=%s running post-crawl migration target=%s", driveID, targetDriveID)
 	if err := a.spider91Migrator.RunOnce(ctx); err != nil {
-		log.Printf("[spider91] drive=%s post-crawl migration: %v", driveID, err)
+		log.Printf("[scriptcrawler] drive=%s post-crawl migration: %v", driveID, err)
 	}
 }
 

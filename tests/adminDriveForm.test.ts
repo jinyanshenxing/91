@@ -205,16 +205,19 @@ test("drive type selector keeps primary source order", () => {
 
 test("crawler management is a separate admin section", () => {
   assert.match(adminLayoutSource, /to="\/admin\/crawlers"/);
-  assert.match(adminLayoutSource, /> 爬虫管理/);
-  assert.match(adminLayoutSource, /SpiderIcon size=\{16\} \/> 爬虫管理/);
+  assert.match(adminLayoutSource, /admin-nav__title">爬虫管理/);
+  assert.match(adminLayoutSource, /admin-nav__icon"><SpiderIcon size=\{16\} \/>/);
   assert.match(appSource, /path="crawlers" element=\{<CrawlersPage \/>/);
   assert.match(crawlerPageSource, /export function CrawlersPage/);
   assert.match(crawlerPageSource, /SpiderIcon/);
   assert.match(crawlerPageSource, /添加爬虫/);
-  assert.match(crawlerPageSource, /返回列表/);
-  assert.match(crawlerPageSource, /setMode\("detail"\)/);
-  assert.match(crawlerPageSource, /setMode\("list"\)/);
+  // 新设计：列表 + Modal 三步编辑器，删除确认走 ConfirmModal，任务进行中自动轮询
+  assert.match(crawlerPageSource, /CrawlerEditorModal/);
+  assert.match(crawlerPageSource, /ConfirmModal/);
+  assert.doesNotMatch(crawlerPageSource, /window\.confirm/);
+  assert.match(crawlerPageSource, /POLL_INTERVAL_MS/);
   assert.match(crawlerPageSource, /api\.listCrawlers/);
+  assert.match(crawlerPageSource, /api\.listDrives/);
   assert.match(crawlerPageSource, /api\.upsertCrawler/);
   assert.match(crawlerPageSource, /api\.runCrawler/);
   assert.match(crawlerPageSource, /api\.stopCrawlerTasks/);
@@ -226,11 +229,15 @@ test("crawler management is a separate admin section", () => {
   assert.match(crawlerPageSource, /链接导入/);
   assert.match(crawlerPageSource, /测试脚本/);
   assert.match(crawlerPageSource, /测试通过/);
+  assert.match(crawlerPageSource, /Spider91UploadTargetField/);
+  assert.match(crawlerPageSource, /uploadDriveId/);
+  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS/);
   assert.doesNotMatch(crawlerPageSource, /新建脚本/);
   assert.doesNotMatch(crawlerPageSource, /爬虫 ID/);
   assert.doesNotMatch(crawlerPageSource, /crawler-id/);
   assert.doesNotMatch(crawlerPageSource, /crawler-name/);
-  assert.doesNotMatch(crawlerPageSource, /脚本路径/);
+  // 脚本路径只读展示，不允许手动填写
+  assert.doesNotMatch(crawlerPageSource, /crawler-script-path/);
   assert.doesNotMatch(crawlerPageSource, /Python 解释器/);
   assert.doesNotMatch(crawlerPageSource, /自定义配置 JSON/);
   assert.doesNotMatch(crawlerPageSource, /Bot/);
@@ -238,6 +245,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /builtin/);
   assert.doesNotMatch(crawlerPageSource, /内置 91/);
   assert.match(apiSource, /type AdminCrawler/);
+  assert.match(apiSource, /uploadDriveId\?: string/);
   assert.match(apiSource, /"\/crawlers"/);
   assert.match(apiSource, /"\/crawlers\/import-file"/);
   assert.match(apiSource, /"\/crawlers\/import-url"/);

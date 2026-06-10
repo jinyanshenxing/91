@@ -200,6 +200,7 @@ export type AdminCrawler = {
   scriptPath: string;
   proxy?: string;
   targetNew?: string;
+  uploadDriveId?: string;
   lastCrawlAt?: number;
   scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -214,6 +215,9 @@ export type AdminCrawler = {
   fingerprintReadyCount: number;
   fingerprintPendingCount: number;
   fingerprintFailedCount: number;
+  totalCrawledCount: number;
+  localVideoCount: number;
+  migratedVideoCount: number;
 };
 
 export type UpsertCrawlerInput = {
@@ -221,6 +225,7 @@ export type UpsertCrawlerInput = {
   scriptPath: string;
   proxy?: string;
   targetNew?: string;
+  uploadDriveId?: string;
 };
 
 export type ImportCrawlerScriptResult = {
