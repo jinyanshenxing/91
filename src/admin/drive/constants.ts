@@ -162,7 +162,7 @@ export function credentialHelp(kind: Kind, isEdit: boolean): string {
         ? "请参考OpenList文档中关于谷歌云盘的配置方法；如不修改凭证，留空即可，保存时会沿用旧值"
         : "请参考OpenList文档中关于谷歌云盘的配置方法";
     case "localstorage":
-      return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链，或指向本地存储根目录内的真实视频路径。Docker 部署时请填写容器内路径。${note}`;
+      return `填写服务器可访问的本地目录绝对路径，例如 /mnt/videos。系统会扫描该目录及子目录中的视频文件和 .strm 文件；.strm 可指向 HTTP/HTTPS 直链或本地视频路径（指向目录外需开启下方开关）。Docker 部署时请填写容器内路径。${note}`;
     case "spider91":
       return "91Spider 不再支持通过网盘添加或编辑。请到后台爬虫管理页面添加爬虫脚本。";
     default:
@@ -329,6 +329,18 @@ export function credentialFields(kind: Kind, creds: Record<string, string> = {})
           placeholder: "/mnt/videos",
           required: true,
           help: "路径必须是后端服务器上的已有目录；保存后可手动重扫，系统会递归扫描支持的视频格式。",
+        },
+        {
+          key: "strm_allow_outside_root",
+          label: ".strm 允许指向目录外",
+          placeholder: "",
+          type: "select",
+          defaultValue: "false",
+          options: [
+            { value: "false", label: "关闭（默认，仅允许目录内路径）" },
+            { value: "true", label: "开启（允许任意本地路径）" },
+          ],
+          help: "开启后 .strm 可指向本目录之外的本地文件（如 rclone 挂载点）。注意：等于允许通过 .strm 读取服务器上任意文件，请只在自己完全掌控媒体目录时开启。Docker 部署时路径必须是容器内路径。",
         },
       ];
     case "spider91":

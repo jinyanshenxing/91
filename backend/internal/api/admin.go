@@ -470,6 +470,8 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		Spider91Proxy                 string           `json:"spider91Proxy,omitempty"`
 		LastCrawlAt                   int64            `json:"lastCrawlAt,omitempty"`
 		GoogleDriveUseOnlineAPI       *bool            `json:"googleDriveUseOnlineAPI,omitempty"`
+		// STRMAllowOutsideRoot 是 localstorage 的 .strm 越root开关；其它 kind 省略。
+		STRMAllowOutsideRoot *bool `json:"strmAllowOutsideRoot,omitempty"`
 		ScanGenerationStatus          GenerationStatus `json:"scanGenerationStatus"`
 		ThumbnailGenerationStatus     GenerationStatus `json:"thumbnailGenerationStatus"`
 		PreviewGenerationStatus       GenerationStatus `json:"previewGenerationStatus"`
@@ -546,6 +548,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 			Spider91Proxy:                 spider91ProxyForDrive(d),
 			LastCrawlAt:                   lastCrawlAt,
 			GoogleDriveUseOnlineAPI:       googleDriveUseOnlineAPIForDrive(d),
+			STRMAllowOutsideRoot:          strmAllowOutsideRootForDrive(d),
 			ScanGenerationStatus:          generation.Scan,
 			ThumbnailGenerationStatus:     generation.Thumbnail,
 			PreviewGenerationStatus:       generation.Preview,
@@ -613,8 +616,10 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		body.Credentials = credentials
-	} else if body.Kind == "googledrive" {
-		body.Credentials = mergeGoogleDriveCredentials(existing, body.Credentials)
+	} else if body.Kind == "googledrive" || body.Kind == "localstorage" {
+		// 按键合并、空值沿用旧值：localstorage 编辑表单里 path 留空表示不改，
+		// 但 strm_allow_outside_root 开关每次都会带值，必须逐键合并而不是整体替换。
+		body.Credentials = mergeNonEmptyCredentials(existing, body.Credentials)
 	} else if len(body.Credentials) == 0 && existing != nil && len(existing.Credentials) > 0 {
 		body.Credentials = existing.Credentials
 	}
@@ -1350,6 +1355,21 @@ func spider91ProxyForDrive(d *catalog.Drive) string {
 	return strings.TrimSpace(d.Credentials["proxy"])
 }
 
+// strmAllowOutsideRootForDrive 返回 localstorage 的 .strm 越root开关；
+// 其它 kind 返回 nil（JSON 省略）。未配置时默认 false。
+func strmAllowOutsideRootForDrive(d *catalog.Drive) *bool {
+	if d == nil || d.Kind != "localstorage" {
+		return nil
+	}
+	result := false
+	if d.Credentials != nil {
+		if v, err := strconv.ParseBool(strings.TrimSpace(d.Credentials["strm_allow_outside_root"])); err == nil {
+			result = v
+		}
+	}
+	return &result
+}
+
 func googleDriveUseOnlineAPIForDrive(d *catalog.Drive) *bool {
 	if d == nil || d.Kind != "googledrive" {
 		return nil
@@ -1370,7 +1390,10 @@ func googleDriveUseOnlineAPIForDrive(d *catalog.Drive) *bool {
 	return &result
 }
 
-func mergeGoogleDriveCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
+// mergeNonEmptyCredentials 逐键合并凭证：incoming 里非空的键覆盖旧值，
+// 空值/缺失的键沿用旧值。googledrive 和 localstorage 的编辑表单都依赖
+// 这个语义（留空 = 不修改）。
+func mergeNonEmptyCredentials(existing *catalog.Drive, incoming map[string]string) map[string]string {
 	merged := map[string]string{}
 	if existing != nil {
 		for k, v := range existing.Credentials {

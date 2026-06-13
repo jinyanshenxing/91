@@ -170,6 +170,14 @@ func main() {
 				return err
 			}
 			app.scheduleCrawlerUploadMigration(ctx, driveID)
+			// 本地存储开启 .strm 越root后，之前因 strm 指向目录外而失败的封面/
+			// 预览/指纹应自动重试，省得用户再手动点三个"重试失败"按钮。
+			if d.Kind == localstorage.Kind &&
+				parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false) {
+				go app.regenFailedThumbnails(ctx, driveID)
+				go app.regenFailedPreviews(ctx, driveID)
+				go app.regenFailedFingerprints(ctx, driveID)
+			}
 			return nil
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
@@ -987,8 +995,9 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		})
 	case localstorage.Kind:
 		drv = localstorage.New(localstorage.Config{
-			ID:       d.ID,
-			RootPath: d.Credentials["path"],
+			ID:                   d.ID,
+			RootPath:             d.Credentials["path"],
+			STRMAllowOutsideRoot: parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false),
 		})
 	case scriptcrawler.Kind:
 		drv = scriptcrawler.New(scriptcrawler.Config{

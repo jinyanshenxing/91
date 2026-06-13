@@ -98,6 +98,8 @@ export type AdminDrive = {
   spider91Proxy?: string;
   // Google Drive 是否使用 OpenList 在线续期 API；未配置时后端按 true 返回。
   googleDriveUseOnlineAPI?: boolean;
+  // localstorage 的 .strm 是否允许指向存储根目录之外；未配置时后端按 false 返回。
+  strmAllowOutsideRoot?: boolean;
   scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
   previewGenerationStatus?: DriveGenerationStatus;
